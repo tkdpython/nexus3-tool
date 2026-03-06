@@ -84,10 +84,7 @@ def login(url):
 
     save_credentials(url, username, password, verify=verify)
     if not verify:
-        click.echo(
-            click.style("Warning: ", fg="yellow")
-            + "SSL verification disabled for this server."
-        )
+        click.echo(click.style("Warning: ", fg="yellow") + "SSL verification disabled for this server.")
     click.echo(click.style("✓ ", fg="green") + "Logged in. Credentials saved to ~/.nexus-credentials")
 
 

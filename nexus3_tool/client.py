@@ -85,9 +85,7 @@ class Nexus3Client:
                 raise Nexus3Error("Not found: {0}".format(path))
             raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
         except SSLError as exc:
-            raise Nexus3SSLError(
-                "SSL certificate verification failed: {0}".format(exc)
-            )
+            raise Nexus3SSLError("SSL certificate verification failed: {0}".format(exc))
         except ConnectionError:
             raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
         except Timeout:
@@ -109,9 +107,7 @@ class Nexus3Client:
                 raise Nexus3Error("Forbidden — you do not have permission to delete.")
             raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
         except SSLError as exc:
-            raise Nexus3SSLError(
-                "SSL certificate verification failed: {0}".format(exc)
-            )
+            raise Nexus3SSLError("SSL certificate verification failed: {0}".format(exc))
         except ConnectionError:
             raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
         except Timeout:
