@@ -172,7 +172,11 @@ def list_docker_images(repo_name, image_name):
 
 
 @main.command("prune-docker-repo")
-@click.argument("image_name")
+@click.option(
+    "--image-name",
+    required=True,
+    help="Name of the image to prune.",
+)
 @click.option(
     "--repo",
     required=True,
@@ -196,7 +200,7 @@ def list_docker_images(repo_name, image_name):
     help="Skip the confirmation prompt.",
 )
 def prune_docker_repo(image_name, repo, keep_last, dry_run, yes):
-    """Prune old tags of IMAGE_NAME in a Docker repository.
+    """Prune old tags of an image in a Docker repository.
 
     Tags are ordered by last-modified date; the most recent --keep-last
     tags are kept and the rest are deleted.
@@ -204,8 +208,8 @@ def prune_docker_repo(image_name, repo, keep_last, dry_run, yes):
     Examples:
 
     \b
-        nexus3-tool prune-docker-repo myapp --repo docker-hosted --keep-last 5
-        nexus3-tool prune-docker-repo myapp --repo docker-hosted --dry-run
+        nexus3-tool prune-docker-repo --image-name myapp --repo docker-hosted --keep-last 5
+        nexus3-tool prune-docker-repo --image-name myapp --repo docker-hosted --dry-run
     """
     try:
         client = _get_client()
