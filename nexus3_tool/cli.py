@@ -5,7 +5,7 @@ Commands follow a docker-style pattern:
     nexus3-tool login <url>
     nexus3-tool list-docker-repos
     nexus3-tool list-docker-images <repo>
-    nexus3-tool prune-docker-repo <image> --repo <repo> --keep-last <n>
+    nexus3-tool prune-docker-images <repo> --image-name <image> --keep-last <n>
 """
 
 import sys
@@ -167,11 +167,11 @@ def list_docker_images(repo_name, image_name):
 
 
 # ---------------------------------------------------------------------------
-# prune-docker-repo
+# prune-docker-images
 # ---------------------------------------------------------------------------
 
 
-@main.command("prune-docker-repo")
+@main.command("prune-docker-images")
 @click.argument("repo_name")
 @click.option(
     "--image-name",
@@ -195,7 +195,7 @@ def list_docker_images(repo_name, image_name):
     is_flag=True,
     help="Skip the confirmation prompt.",
 )
-def prune_docker_repo(repo_name, image_name, keep_last, dry_run, yes):
+def prune_docker_images(repo_name, image_name, keep_last, dry_run, yes):
     """Prune old tags of an image in REPO_NAME.
 
     Tags are ordered by last-modified date; the most recent --keep-last
@@ -204,8 +204,8 @@ def prune_docker_repo(repo_name, image_name, keep_last, dry_run, yes):
     Examples:
 
     \b
-        nexus3-tool prune-docker-repo development --image-name myapp --keep-last 5
-        nexus3-tool prune-docker-repo development --image-name myapp --dry-run
+        nexus3-tool prune-docker-images development --image-name myapp --keep-last 5
+        nexus3-tool prune-docker-images development --image-name myapp --dry-run
     """
     try:
         client = _get_client()
