@@ -215,7 +215,7 @@ def prune_docker_repo(repo_name, image_name, keep_last, dry_run, yes):
         return
 
     if not components:
-        click.echo("No tags found for '{0}' in repository '{1}'.".format(image_name, repo))
+        click.echo("No tags found for '{0}' in repository '{1}'.".format(image_name, repo_name))
         return
 
     # Sort newest -> oldest by last-modified asset date
@@ -226,7 +226,7 @@ def prune_docker_repo(repo_name, image_name, keep_last, dry_run, yes):
 
     click.echo(
         "\nImage: {repo}/{image}  ({n} tag(s) found)".format(
-            repo=repo,
+            repo=repo_name,
             image=image_name,
             n=len(components),
         )
