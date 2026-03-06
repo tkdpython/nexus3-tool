@@ -149,13 +149,19 @@ class Nexus3Client:
         # type: (str, Optional[str]) -> List[Dict]
         """Return a list of components with name, tag and last-modified date.
 
-        If name is provided it is passed to the API as a server-side filter.
+        When name is provided, uses the /search endpoint which supports server-side
+        name filtering. Without a name filter, /components is used to list everything.
         """
-        params = {"repository": repository}
         if name:
-            params["name"] = name
+            # /search supports name filtering reliably
+            endpoint = "/service/rest/v1/search"
+            params = {"repository": repository, "name": name, "format": "docker"}
+        else:
+            endpoint = "/service/rest/v1/components"
+            params = {"repository": repository}
+
         rows = []
-        for comp in self._iter_pages("/service/rest/v1/components", params):
+        for comp in self._iter_pages(endpoint, params):
             rows.append(
                 {
                     "name": comp.get("name", ""),
