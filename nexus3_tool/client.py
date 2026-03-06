@@ -145,11 +145,17 @@ class Nexus3Client:
         """Return all Docker-format repositories."""
         return [r for r in self.list_repositories() if r.get("format") == "docker"]
 
-    def list_docker_images(self, repository):
-        # type: (str) -> List[Dict]
-        """Return a list of components with name, tag and last-modified date."""
+    def list_docker_images(self, repository, name=None):
+        # type: (str, Optional[str]) -> List[Dict]
+        """Return a list of components with name, tag and last-modified date.
+
+        If name is provided it is passed to the API as a server-side filter.
+        """
+        params = {"repository": repository}
+        if name:
+            params["name"] = name
         rows = []
-        for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
+        for comp in self._iter_pages("/service/rest/v1/components", params):
             rows.append(
                 {
                     "name": comp.get("name", ""),

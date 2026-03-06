@@ -127,17 +127,25 @@ def list_docker_repos():
 
 @main.command("list-docker-images")
 @click.argument("repo_name")
-def list_docker_images(repo_name):
+@click.option(
+    "--image-name",
+    default=None,
+    help="Filter results to a specific image name (server-side, much faster for large repos).",
+)
+def list_docker_images(repo_name, image_name):
     """List all Docker images and tags in REPO_NAME."""
     try:
         client = _get_client()
-        rows = client.list_docker_images(repo_name)
+        rows = client.list_docker_images(repo_name, name=image_name)
     except (Nexus3Error, SystemExit) as exc:
         _abort(str(exc))
         return
 
     if not rows:
-        click.echo("No images found in repository '{0}'.".format(repo_name))
+        if image_name:
+            click.echo("No images matching '{0}' found in repository '{1}'.".format(image_name, repo_name))
+        else:
+            click.echo("No images found in repository '{0}'.".format(repo_name))
         return
 
     # Sort by image name then tag
