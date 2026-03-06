@@ -3,47 +3,238 @@ nexus3-tool CLI entry point.
 
 Commands follow a docker-style pattern:
     nexus3-tool login <url>
-    nexus3-tool prune-docker-repo <image> --keep-last=<n>
+    nexus3-tool list-docker-repos
+    nexus3-tool list-docker-images <repo>
+    nexus3-tool prune-docker-repo <image> --repo <repo> --keep-last <n>
 """
+
+import sys
 
 import click
 
 from nexus3_tool import __version__
+from nexus3_tool.auth import load_credentials, save_credentials
+from nexus3_tool.client import Nexus3Client, Nexus3Error, _get_last_modified
+
+
+def _get_client():
+    # type: () -> Nexus3Client
+    """Load stored credentials and return a ready Nexus3Client."""
+    creds = load_credentials()
+    return Nexus3Client(creds["url"], creds["username"], creds["password"])
+
+
+def _abort(message):
+    # type: (str) -> None
+    click.echo(click.style("Error: ", fg="red", bold=True) + message, err=True)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# CLI group
+# ---------------------------------------------------------------------------
 
 
 @click.group()
 @click.version_option(version=__version__, prog_name="nexus3-tool")
-def main() -> None:
+def main():
     """nexus3-tool — Manage Sonatype Nexus3 via its REST API."""
     pass
 
 
+# ---------------------------------------------------------------------------
+# login
+# ---------------------------------------------------------------------------
+
+
 @main.command()
 @click.argument("url")
-def login(url: str) -> None:
+def login(url):
     """Authenticate with a Nexus3 instance and store credentials.
 
     URL is the base URL of your Nexus3 instance, e.g. https://nexus.example.com
     """
-    click.echo(click.style("nexus3-tool", fg="cyan", bold=True) + f" v{__version__} — coming in a future release! 🚀")
-    click.echo(f"  Would store credentials for: {url}")
+    username = click.prompt("Username")
+    password = click.prompt("Password", hide_input=True)
+
+    click.echo("Verifying credentials...")
+    client = Nexus3Client(url, username, password)
+    try:
+        client.check_auth()
+    except Nexus3Error as exc:
+        _abort(str(exc))
+
+    save_credentials(url, username, password)
+    click.echo(click.style("✓ ", fg="green") + "Logged in. Credentials saved to ~/.nexus-credentials")
+
+
+# ---------------------------------------------------------------------------
+# list-docker-repos
+# ---------------------------------------------------------------------------
+
+
+@main.command("list-docker-repos")
+def list_docker_repos():
+    """List all Docker repositories."""
+    try:
+        client = _get_client()
+        repos = client.list_docker_repositories()
+    except (Nexus3Error, SystemExit) as exc:
+        _abort(str(exc))
+        return  # unreachable, keeps type checkers happy
+
+    if not repos:
+        click.echo("No Docker repositories found.")
+        return
+
+    col = 30
+    click.echo(click.style("{:<{col}}  {:<10}".format("NAME", "TYPE", col=col), bold=True))
+    click.echo("-" * (col + 12))
+    for repo in sorted(repos, key=lambda r: r.get("name", "")):
+        click.echo(
+            "{:<{col}}  {:<10}".format(
+                repo.get("name", ""),
+                repo.get("type", ""),
+                col=col,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# list-docker-images
+# ---------------------------------------------------------------------------
+
+
+@main.command("list-docker-images")
+@click.argument("repo_name")
+def list_docker_images(repo_name):
+    """List all Docker images in REPO_NAME."""
+    try:
+        client = _get_client()
+        images = client.list_docker_images(repo_name)
+    except (Nexus3Error, SystemExit) as exc:
+        _abort(str(exc))
+        return
+
+    if not images:
+        click.echo("No images found in repository '{0}'.".format(repo_name))
+        return
+
+    col = 40
+    click.echo(click.style("{:<{col}}  TAGS".format("IMAGE", col=col), bold=True))
+    click.echo("-" * (col + 20))
+    for name in sorted(images):
+        tags = ", ".join(sorted(images[name]))
+        click.echo("{:<{col}}  {tags}".format(name, col=col, tags=tags))
+
+
+# ---------------------------------------------------------------------------
+# prune-docker-repo
+# ---------------------------------------------------------------------------
 
 
 @main.command("prune-docker-repo")
 @click.argument("image_name")
 @click.option(
+    "--repo",
+    required=True,
+    help="Name of the Nexus3 Docker repository containing the image.",
+)
+@click.option(
     "--keep-last",
     default=5,
     show_default=True,
-    help="Number of most recent image tags to keep.",
+    help="Number of most recent tags to keep.",
 )
-def prune_docker_repo(image_name: str, keep_last: int) -> None:
-    """Prune old tags from a Nexus3 Docker repository.
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Preview what would be deleted without making any changes.",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Skip the confirmation prompt.",
+)
+def prune_docker_repo(image_name, repo, keep_last, dry_run, yes):
+    """Prune old tags of IMAGE_NAME in a Docker repository.
 
-    IMAGE_NAME is the name of the hosted Docker repository / image to prune.
+    Tags are ordered by last-modified date; the most recent --keep-last
+    tags are kept and the rest are deleted.
+
+    Examples:
+
+    \b
+        nexus3-tool prune-docker-repo myapp --repo docker-hosted --keep-last 5
+        nexus3-tool prune-docker-repo myapp --repo docker-hosted --dry-run
     """
-    click.echo(click.style("nexus3-tool", fg="cyan", bold=True) + f" v{__version__} — coming in a future release! 🚀")
-    click.echo(f"  Would prune '{image_name}', keeping the {keep_last} most recent tags.")
+    try:
+        client = _get_client()
+        components = client.get_image_components(repo, image_name)
+    except (Nexus3Error, SystemExit) as exc:
+        _abort(str(exc))
+        return
+
+    if not components:
+        click.echo("No tags found for '{0}' in repository '{1}'.".format(image_name, repo))
+        return
+
+    # Sort newest -> oldest by last-modified asset date
+    components.sort(key=_get_last_modified, reverse=True)
+
+    to_keep = components[:keep_last]
+    to_delete = components[keep_last:]
+
+    click.echo(
+        "\nImage: {repo}/{image}  ({n} tag(s) found)".format(
+            repo=repo,
+            image=image_name,
+            n=len(components),
+        )
+    )
+
+    click.echo(click.style("\nTags to keep ({0}):".format(len(to_keep)), fg="green"))
+    for comp in to_keep:
+        click.echo("  +  {0}:{1}".format(comp.get("name"), comp.get("version")))
+
+    if not to_delete:
+        click.echo("\nNothing to delete — all tags are within the keep-last limit.")
+        return
+
+    click.echo(click.style("\nTags to delete ({0}):".format(len(to_delete)), fg="red"))
+    for comp in to_delete:
+        click.echo("  -  {0}:{1}".format(comp.get("name"), comp.get("version")))
+
+    if dry_run:
+        click.echo(click.style("\n[dry-run] No changes made.", fg="yellow"))
+        return
+
+    if not yes:
+        click.confirm(
+            "\nDelete {0} tag(s)?".format(len(to_delete)),
+            abort=True,
+        )
+
+    click.echo("")
+    deleted = 0
+    errors = 0
+    for comp in to_delete:
+        tag = comp.get("version", "?")
+        try:
+            client.delete_component(comp["id"])
+            click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(image_name, tag))
+            deleted += 1
+        except Nexus3Error as exc:
+            click.echo(
+                click.style(
+                    "  Failed to delete {0}:{1} — {2}".format(image_name, tag, exc),
+                    fg="red",
+                )
+            )
+            errors += 1
+
+    click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=deleted, err=errors))
 
 
 if __name__ == "__main__":
