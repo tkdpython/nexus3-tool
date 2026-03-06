@@ -150,11 +150,13 @@ class Nexus3Client:
         """Return a list of components with name, tag and last-modified date."""
         rows = []
         for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
-            rows.append({
-                "name": comp.get("name", ""),
-                "tag": comp.get("version", "?"),
-                "published": _get_last_modified(comp),
-            })
+            rows.append(
+                {
+                    "name": comp.get("name", ""),
+                    "tag": comp.get("version", "?"),
+                    "published": _get_last_modified(comp),
+                }
+            )
         return rows
 
     def get_image_components(self, repository, image_name):

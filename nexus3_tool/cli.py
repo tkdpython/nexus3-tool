@@ -146,9 +146,7 @@ def list_docker_images(repo_name):
     col_image = max(len("{0}:{1}".format(r["name"], r["tag"])) for r in rows)
     col_image = max(col_image, 10)  # minimum width
 
-    click.echo(
-        click.style("{:<{w}}  {}".format("IMAGE:TAG", "PUBLISHED", w=col_image), bold=True)
-    )
+    click.echo(click.style("{:<{w}}  {}".format("IMAGE:TAG", "PUBLISHED", w=col_image), bold=True))
     click.echo("-" * (col_image + 22))
     for r in rows:
         image_tag = "{0}:{1}".format(r["name"], r["tag"])
