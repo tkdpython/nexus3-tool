@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+memories/
+AGENT.md
+
 # C extensions
 *.so
 

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "nexus3-tool"
+version = "0.1.0"
+description = "A CLI tool for managing Sonatype Nexus3 via its REST API"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "tkdpython" }]
+requires-python = ">=3.8"
+keywords = ["nexus3", "sonatype", "cli", "devops", "docker", "repository-management"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "click>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tkdpython/nexus3-tool"
+Repository = "https://github.com/tkdpython/nexus3-tool"
+Issues = "https://github.com/tkdpython/nexus3-tool/issues"
+
+[project.scripts]
+nexus3-tool = "nexus3_tool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nexus3_tool*"]
