@@ -146,16 +146,16 @@ class Nexus3Client:
         return [r for r in self.list_repositories() if r.get("format") == "docker"]
 
     def list_docker_images(self, repository):
-        # type: (str) -> Dict[str, List[str]]
-        """Return a dict of {image_name: [tag, ...]} for a Docker repository."""
-        images = {}  # type: Dict[str, List[str]]
+        # type: (str) -> List[Dict]
+        """Return a list of components with name, tag and last-modified date."""
+        rows = []
         for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
-            name = comp.get("name", "")
-            version = comp.get("version", "?")
-            if name not in images:
-                images[name] = []
-            images[name].append(version)
-        return images
+            rows.append({
+                "name": comp.get("name", ""),
+                "tag": comp.get("version", "?"),
+                "published": _get_last_modified(comp),
+            })
+        return rows
 
     def get_image_components(self, repository, image_name):
         # type: (str, str) -> List[Dict]

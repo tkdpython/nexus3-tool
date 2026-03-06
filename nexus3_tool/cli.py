@@ -128,24 +128,36 @@ def list_docker_repos():
 @main.command("list-docker-images")
 @click.argument("repo_name")
 def list_docker_images(repo_name):
-    """List all Docker images in REPO_NAME."""
+    """List all Docker images and tags in REPO_NAME."""
     try:
         client = _get_client()
-        images = client.list_docker_images(repo_name)
+        rows = client.list_docker_images(repo_name)
     except (Nexus3Error, SystemExit) as exc:
         _abort(str(exc))
         return
 
-    if not images:
+    if not rows:
         click.echo("No images found in repository '{0}'.".format(repo_name))
         return
 
-    col = 40
-    click.echo(click.style("{:<{col}}  TAGS".format("IMAGE", col=col), bold=True))
-    click.echo("-" * (col + 20))
-    for name in sorted(images):
-        tags = ", ".join(sorted(images[name]))
-        click.echo("{:<{col}}  {tags}".format(name, col=col, tags=tags))
+    # Sort by image name then tag
+    rows.sort(key=lambda r: (r["name"], r["tag"]))
+
+    col_image = max(len("{0}:{1}".format(r["name"], r["tag"])) for r in rows)
+    col_image = max(col_image, 10)  # minimum width
+
+    click.echo(
+        click.style("{:<{w}}  {}".format("IMAGE:TAG", "PUBLISHED", w=col_image), bold=True)
+    )
+    click.echo("-" * (col_image + 22))
+    for r in rows:
+        image_tag = "{0}:{1}".format(r["name"], r["tag"])
+        published = r["published"]
+        if published.year == 1:
+            date_str = "unknown"
+        else:
+            date_str = published.strftime("%Y-%m-%d %H:%M")
+        click.echo("{:<{w}}  {}".format(image_tag, date_str, w=col_image))
 
 
 # ---------------------------------------------------------------------------
