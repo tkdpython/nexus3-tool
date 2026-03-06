@@ -34,6 +34,16 @@ def _parse_date(date_str):
     return datetime.min
 
 
+def _get_manifest_digest(component):
+    # type: (Dict[str, Any]) -> Optional[str]
+    """Return the sha256 digest of the manifest asset for a component, or None."""
+    for asset in component.get("assets", []):
+        path = asset.get("path", "")
+        if "/manifests/" in path:
+            return asset.get("checksum", {}).get("sha256")
+    return None
+
+
 def _get_last_modified(component):
     # type: (Dict[str, Any]) -> datetime
     """Return the most recent lastModified timestamp across a component's assets."""

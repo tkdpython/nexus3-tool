@@ -14,7 +14,7 @@ import click
 
 from nexus3_tool import __version__
 from nexus3_tool.auth import load_credentials, save_credentials
-from nexus3_tool.client import Nexus3Client, Nexus3Error, Nexus3SSLError, _get_last_modified
+from nexus3_tool.client import Nexus3Client, Nexus3Error, Nexus3SSLError, _get_last_modified, _get_manifest_digest
 
 
 def _get_client():
@@ -218,23 +218,50 @@ def prune_docker_images(repo_name, image_name, keep_last, dry_run, yes):
         click.echo("No tags found for '{0}' in repository '{1}'.".format(image_name, repo_name))
         return
 
-    # Sort newest -> oldest by last-modified asset date
-    components.sort(key=_get_last_modified, reverse=True)
+    # Separate the 'latest' tag — it's always kept and not counted against keep-last
+    latest_comp = None
+    versioned = []
+    for comp in components:
+        if comp.get("version") == "latest":
+            latest_comp = comp
+        else:
+            versioned.append(comp)
 
-    to_keep = components[:keep_last]
-    to_delete = components[keep_last:]
+    # Find which versioned tag 'latest' is an alias for (same manifest digest)
+    latest_alias = None
+    if latest_comp:
+        latest_digest = _get_manifest_digest(latest_comp)
+        if latest_digest:
+            for comp in versioned:
+                if _get_manifest_digest(comp) == latest_digest:
+                    latest_alias = comp.get("version")
+                    break
 
+    # Sort versioned tags newest -> oldest
+    versioned.sort(key=_get_last_modified, reverse=True)
+
+    to_keep = versioned[:keep_last]
+    to_delete = versioned[keep_last:]
+
+    total = len(components)
+    latest_note = " (excludes 'latest' tag which is always kept)" if latest_comp else ""
     click.echo(
-        "\nImage: {repo}/{image}  ({n} tag(s) found)".format(
+        "\nImage: {repo}/{image}  ({n} tag(s) found{note})".format(
             repo=repo_name,
             image=image_name,
-            n=len(components),
+            n=total,
+            note=latest_note,
         )
     )
 
-    click.echo(click.style("\nTags to keep ({0}):".format(len(to_keep)), fg="green"))
+    click.echo(click.style("\nTags to keep ({0}):".format(len(to_keep) + (1 if latest_comp else 0)), fg="green"))
+    if latest_comp:
+        alias_note = "  [same image as {0}]".format(latest_alias) if latest_alias else ""
+        click.echo("  +  {0}:latest{1}".format(image_name, alias_note))
     for comp in to_keep:
-        click.echo("  +  {0}:{1}".format(comp.get("name"), comp.get("version")))
+        version = comp.get("version")
+        alias_note = "  [latest]".format(version) if version == latest_alias else ""
+        click.echo("  +  {0}:{1}{2}".format(comp.get("name"), version, alias_note))
 
     if not to_delete:
         click.echo("\nNothing to delete — all tags are within the keep-last limit.")
