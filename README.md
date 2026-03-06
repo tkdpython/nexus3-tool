@@ -1,6 +1,6 @@
 # nexus3-tool
 
-[![PyPI version](https://badge.fury.io/py/nexus3-tool.svg)](https://badge.fury.io/py/nexus3-tool)
+[![PyPI version](https://img.shields.io/pypi/v/nexus3-tool)](https://pypi.org/project/nexus3-tool/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/nexus3-tool)](https://pypi.org/project/nexus3-tool/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Publish to PyPI](https://github.com/tkdpython/nexus3-tool/actions/workflows/publish.yml/badge.svg)](https://github.com/tkdpython/nexus3-tool/actions/workflows/publish.yml)
@@ -39,11 +39,20 @@ Commands:
 
 Authenticate with your Nexus3 instance. Credentials (including SSL preference) are stored in `~/.nexus-credentials` and reused by all subsequent commands.
 
+**Interactive (default) — prompts for username and password:**
 ```bash
 nexus3-tool login https://nexus.example.com
 ```
 
 If the server uses an internal or self-signed certificate, the tool will detect the SSL failure and prompt you to disable verification — no flags required.
+
+**Non-interactive — for use in CI/CD pipelines:**
+```bash
+nexus3-tool login https://nexus.example.com --username admin --password secret
+
+# With an internal/self-signed certificate:
+nexus3-tool login https://nexus.example.com --username admin --password secret --ignore-untrusted-certs
+```
 
 ---
 

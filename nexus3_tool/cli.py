@@ -50,37 +50,78 @@ def main():
 
 @main.command()
 @click.argument("url")
-def login(url):
+@click.option(
+    "--username",
+    "-u",
+    default=None,
+    help="Username (prompted if not provided).",
+)
+@click.option(
+    "--password",
+    "-p",
+    default=None,
+    help="Password (prompted if not provided).",
+)
+@click.option(
+    "--ignore-untrusted-certs",
+    is_flag=True,
+    default=False,
+    help="Disable SSL certificate verification without prompting (useful in CI/CD pipelines).",
+)
+def login(url, username, password, ignore_untrusted_certs):
     """Authenticate with a Nexus3 instance and store credentials.
 
     URL is the base URL of your Nexus3 instance, e.g. https://nexus.example.com
+
+    Interactive (default):
+
+    \b
+        nexus3-tool login https://nexus.example.com
+
+    Non-interactive for CI/CD pipelines:
+
+    \b
+        nexus3-tool login https://nexus.example.com --username admin --password secret
+        nexus3-tool login https://nexus.example.com --username admin --password secret --ignore-untrusted-certs
     """
-    username = click.prompt("Username")
-    password = click.prompt("Password", hide_input=True)
+    if username is None:
+        username = click.prompt("Username")
+    if password is None:
+        password = click.prompt("Password", hide_input=True)
 
     click.echo("Verifying credentials...")
     verify = True
-    client = Nexus3Client(url, username, password, verify=True)
-    try:
-        client.check_auth()
-    except Nexus3SSLError:
-        click.echo(
-            click.style("\nSSL Warning: ", fg="yellow", bold=True)
-            + "The server certificate could not be verified.\n"
-            + "  This usually means the server uses an internal or self-signed CA.\n"
-            + "  Continuing without verification means connections are encrypted\n"
-            + "  but the server identity will not be validated."
-        )
-        if not click.confirm("\nDisable SSL verification for this server?"):
-            _abort("Login cancelled.")
+
+    if ignore_untrusted_certs:
         verify = False
+        click.echo(click.style("Warning: ", fg="yellow") + "SSL verification disabled (--ignore-untrusted-certs).")
         client = Nexus3Client(url, username, password, verify=False)
         try:
             client.check_auth()
         except Nexus3Error as exc:
             _abort(str(exc))
-    except Nexus3Error as exc:
-        _abort(str(exc))
+    else:
+        client = Nexus3Client(url, username, password, verify=True)
+        try:
+            client.check_auth()
+        except Nexus3SSLError:
+            click.echo(
+                click.style("\nSSL Warning: ", fg="yellow", bold=True)
+                + "The server certificate could not be verified.\n"
+                + "  This usually means the server uses an internal or self-signed CA.\n"
+                + "  Continuing without verification means connections are encrypted\n"
+                + "  but the server identity will not be validated."
+            )
+            if not click.confirm("\nDisable SSL verification for this server?"):
+                _abort("Login cancelled.")
+            verify = False
+            client = Nexus3Client(url, username, password, verify=False)
+            try:
+                client.check_auth()
+            except Nexus3Error as exc:
+                _abort(str(exc))
+        except Nexus3Error as exc:
+            _abort(str(exc))
 
     save_credentials(url, username, password, verify=verify)
     if not verify:
