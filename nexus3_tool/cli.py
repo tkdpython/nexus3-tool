@@ -25,10 +25,7 @@ def login(url: str) -> None:
 
     URL is the base URL of your Nexus3 instance, e.g. https://nexus.example.com
     """
-    click.echo(
-        click.style("nexus3-tool", fg="cyan", bold=True)
-        + f" v{__version__} — coming in a future release! 🚀"
-    )
+    click.echo(click.style("nexus3-tool", fg="cyan", bold=True) + f" v{__version__} — coming in a future release! 🚀")
     click.echo(f"  Would store credentials for: {url}")
 
 
@@ -45,13 +42,8 @@ def prune_docker_repo(image_name: str, keep_last: int) -> None:
 
     IMAGE_NAME is the name of the hosted Docker repository / image to prune.
     """
-    click.echo(
-        click.style("nexus3-tool", fg="cyan", bold=True)
-        + f" v{__version__} — coming in a future release! 🚀"
-    )
-    click.echo(
-        f"  Would prune '{image_name}', keeping the {keep_last} most recent tags."
-    )
+    click.echo(click.style("nexus3-tool", fg="cyan", bold=True) + f" v{__version__} — coming in a future release! 🚀")
+    click.echo(f"  Would prune '{image_name}', keeping the {keep_last} most recent tags.")
 
 
 if __name__ == "__main__":
