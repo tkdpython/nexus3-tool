@@ -8,13 +8,14 @@ from typing import Dict
 CREDENTIALS_FILE = Path.home() / ".nexus-credentials"
 
 
-def save_credentials(url, username, password):
-    # type: (str, str, str) -> None
+def save_credentials(url, username, password, verify=True):
+    # type: (str, str, str, bool) -> None
     """Save Nexus3 credentials to ~/.nexus-credentials (mode 600)."""
     creds = {
         "url": url.rstrip("/"),
         "username": username,
         "password": password,
+        "verify": verify,
     }
     with open(str(CREDENTIALS_FILE), "w") as f:
         json.dump(creds, f, indent=2)

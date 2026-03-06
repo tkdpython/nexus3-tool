@@ -4,11 +4,17 @@ from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
-from requests.exceptions import ConnectionError, HTTPError, Timeout
+from requests.exceptions import ConnectionError, HTTPError, SSLError, Timeout
 
 
 class Nexus3Error(Exception):
     """Raised for all Nexus3 API errors."""
+
+    pass
+
+
+class Nexus3SSLError(Nexus3Error):
+    """Raised when the server certificate cannot be verified."""
 
     pass
 
@@ -42,12 +48,18 @@ def _get_last_modified(component):
 class Nexus3Client:
     """Thin wrapper around the Nexus3 REST API."""
 
-    def __init__(self, url, username, password):
-        # type: (str, str, str) -> None
+    def __init__(self, url, username, password, verify=True):
+        # type: (str, str, str, bool) -> None
         self.base_url = url.rstrip("/")
         self.session = requests.Session()
         self.session.auth = (username, password)
         self.session.headers.update({"Accept": "application/json"})
+        self.session.verify = verify
+        if not verify:
+            # Suppress the InsecureRequestWarning when verification is disabled
+            import urllib3
+
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -72,6 +84,10 @@ class Nexus3Client:
             if code == 404:
                 raise Nexus3Error("Not found: {0}".format(path))
             raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
+        except SSLError as exc:
+            raise Nexus3SSLError(
+                "SSL certificate verification failed: {0}".format(exc)
+            )
         except ConnectionError:
             raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
         except Timeout:
@@ -92,6 +108,10 @@ class Nexus3Client:
             if code == 403:
                 raise Nexus3Error("Forbidden — you do not have permission to delete.")
             raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
+        except SSLError as exc:
+            raise Nexus3SSLError(
+                "SSL certificate verification failed: {0}".format(exc)
+            )
         except ConnectionError:
             raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
         except Timeout:

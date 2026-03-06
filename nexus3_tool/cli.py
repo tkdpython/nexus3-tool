@@ -14,14 +14,15 @@ import click
 
 from nexus3_tool import __version__
 from nexus3_tool.auth import load_credentials, save_credentials
-from nexus3_tool.client import Nexus3Client, Nexus3Error, _get_last_modified
+from nexus3_tool.client import Nexus3Client, Nexus3Error, Nexus3SSLError, _get_last_modified
 
 
 def _get_client():
     # type: () -> Nexus3Client
     """Load stored credentials and return a ready Nexus3Client."""
     creds = load_credentials()
-    return Nexus3Client(creds["url"], creds["username"], creds["password"])
+    verify = creds.get("verify", True)
+    return Nexus3Client(creds["url"], creds["username"], creds["password"], verify=verify)
 
 
 def _abort(message):
@@ -58,13 +59,35 @@ def login(url):
     password = click.prompt("Password", hide_input=True)
 
     click.echo("Verifying credentials...")
-    client = Nexus3Client(url, username, password)
+    verify = True
+    client = Nexus3Client(url, username, password, verify=True)
     try:
         client.check_auth()
+    except Nexus3SSLError:
+        click.echo(
+            click.style("\nSSL Warning: ", fg="yellow", bold=True)
+            + "The server certificate could not be verified.\n"
+            + "  This usually means the server uses an internal or self-signed CA.\n"
+            + "  Continuing without verification means connections are encrypted\n"
+            + "  but the server identity will not be validated."
+        )
+        if not click.confirm("\nDisable SSL verification for this server?"):
+            _abort("Login cancelled.")
+        verify = False
+        client = Nexus3Client(url, username, password, verify=False)
+        try:
+            client.check_auth()
+        except Nexus3Error as exc:
+            _abort(str(exc))
     except Nexus3Error as exc:
         _abort(str(exc))
 
-    save_credentials(url, username, password)
+    save_credentials(url, username, password, verify=verify)
+    if not verify:
+        click.echo(
+            click.style("Warning: ", fg="yellow")
+            + "SSL verification disabled for this server."
+        )
     click.echo(click.style("✓ ", fg="green") + "Logged in. Credentials saved to ~/.nexus-credentials")
 
 
