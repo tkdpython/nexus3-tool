@@ -10,6 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "tkdpython" }]
 requires-python = ">=3.6"
+dynamic = ["dependencies"]
 keywords = ["nexus3", "sonatype", "cli", "devops", "docker", "repository-management"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
@@ -28,11 +29,6 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Systems Administration",
 ]
-dependencies = [
-    "click>=8.0",
-    "requests>=2.18",
-]
-
 [project.urls]
 Homepage = "https://github.com/tkdpython/nexus3-tool"
 Repository = "https://github.com/tkdpython/nexus3-tool"
@@ -44,3 +40,6 @@ nexus3-tool = "nexus3_tool.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nexus3_tool*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
