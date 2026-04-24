@@ -93,6 +93,9 @@ nexus3-tool prune-docker-images production --image-name myapp --keep-last 5
 
 # Keep the 10 most recent tags, skip confirmation prompt
 nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 --yes
+
+# Short flag equivalent
+nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 -y
 ```
 
 Tags are sorted by last-modified date. If `latest` is an alias for a versioned tag, both are annotated in the output so you can see exactly what is being kept.
