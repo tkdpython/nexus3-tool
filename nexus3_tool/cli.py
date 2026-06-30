@@ -118,8 +118,6 @@ def _filter_rows(rows, older_than=None, include_regex=None, exclude_regex=None, 
 def _sort_rows(rows, sort_by="name", reverse=False):
     if sort_by == "published":
         key = lambda r: r.get("published", datetime.min)
-    elif sort_by == "size":
-        key = lambda r: r.get("size", 0)
     else:
         key = lambda r: (r.get("name", ""), r.get("tag", ""))
     rows.sort(key=key, reverse=reverse)
@@ -135,8 +133,6 @@ def _row_payload(row):
         "tag": row.get("tag"),
         "image": "{0}:{1}".format(row.get("name"), row.get("tag")),
         "published": published,
-        "size_bytes": int(row.get("size", 0) or 0),
-        "size": _format_bytes(row.get("size", 0)),
     }
 
 
@@ -279,8 +275,18 @@ def _get_remaining_delete_context_rows(client, repo_name, to_delete, image_compo
 
 def _component_asset_usage(client, component):
     # type: (Nexus3Client, dict) -> list
-    """Return dedupe-ready image usage entries for a Nexus component."""
-    return client.get_component_image_usage(component)
+    """Return Nexus REST asset metadata entries without downloading manifests."""
+    entries = []
+    fallback_index = 0
+    for asset in component.get("assets", []) or []:
+        checksum = asset.get("checksum") or {}
+        key = checksum.get("sha256") or asset.get("path")
+        size = int(asset.get("fileSize") or 0)
+        if key is None:
+            fallback_index += 1
+            key = ("asset", fallback_index)
+        entries.append((key, size))
+    return entries
 
 
 def _component_size(client, component):
@@ -504,7 +510,7 @@ def list_docker_repos():
 @click.option("--include-regex", default=None, help="Only include IMAGE:TAG values matching this regex.")
 @click.option("--exclude-regex", default=None, help="Exclude IMAGE:TAG values matching this regex.")
 @click.option("--exclude-tags", default=None, help="Comma-separated tag names to exclude, e.g. latest,main,prod.")
-@click.option("--sort", "sort_by", type=click.Choice(["name", "published", "size"]), default="name", show_default=True)
+@click.option("--sort", "sort_by", type=click.Choice(["name", "published"]), default="name", show_default=True)
 @click.option("--reverse", is_flag=True, help="Reverse the chosen sort order.")
 @click.option("--limit", type=int, default=None, help="Maximum rows to display after filtering/sorting.")
 @click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
@@ -522,18 +528,15 @@ def list_docker_images(repo_name, image_name, older_than, include_regex, exclude
         _abort(str(exc))
         return
 
-    total_size = _sum_unique_asset_usage(rows)
     if json_output:
         _emit_json(
             {
                 "repository": repo_name,
                 "image_name": image_name,
                 "matched_tags": len(rows),
-                "matched_image_usage_bytes": total_size,
-                "matched_image_usage": _format_bytes(total_size),
                 "blob_store": blob_summary,
                 "images": [_row_payload(row) for row in rows],
-                "note": "Image size is compressed config+layers from Docker/OCI manifests; physical reclaimable space can be lower for shared layers and requires Nexus cleanup.",
+                "note": "Per-image/repository usage is intentionally not calculated; only best-effort blob-store total/available space is reported when Nexus permissions allow it.",
             }
         )
         return
@@ -547,16 +550,14 @@ def list_docker_images(repo_name, image_name, older_than, include_regex, exclude
 
     col_image = max(len("{0}:{1}".format(r["name"], r["tag"])) for r in rows)
     col_image = max(col_image, 10)  # minimum width
-    col_size = max(len(_format_bytes(r.get("size", 0))) for r in rows)
-    col_size = max(col_size, len("SIZE"))
 
     click.echo(
         click.style(
-            "{:<{w}}  {:<16}  {:>{sw}}".format("IMAGE:TAG", "PUBLISHED", "SIZE", w=col_image, sw=col_size),
+            "{:<{w}}  {:<16}".format("IMAGE:TAG", "PUBLISHED", w=col_image),
             bold=True,
         )
     )
-    click.echo("-" * (col_image + col_size + 22))
+    click.echo("-" * (col_image + 18))
     for r in rows:
         image_tag = "{0}:{1}".format(r["name"], r["tag"])
         published = r["published"]
@@ -565,18 +566,15 @@ def list_docker_images(repo_name, image_name, older_than, include_regex, exclude
         else:
             date_str = published.strftime("%Y-%m-%d %H:%M")
         click.echo(
-            "{:<{w}}  {:<16}  {:>{sw}}".format(
+            "{:<{w}}  {:<16}".format(
                 image_tag,
                 date_str,
-                _format_bytes(r.get("size", 0)),
                 w=col_image,
-                sw=col_size,
             )
         )
 
     click.echo("\nMatched tags: {0}".format(len(rows)))
-    click.echo("Matched image disk usage: {0}".format(_format_bytes(total_size)))
-    click.echo("Note: image size is compressed config+layers; reclaimable disk may be lower for shared layers and requires Nexus cleanup.")
+    click.echo("Note: per-image/repository usage is intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
 
     _print_blob_store_summary(blob_summary)
 
@@ -640,10 +638,6 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
             click.echo("No matching tags to delete for '{0}' in repository '{1}'.".format(image_name, repo_name))
         return
 
-    selected_rows = _rows_for_components(client, to_delete)
-    selected_row_by_id = dict((comp.get("id"), row) for comp, row in zip(to_delete, selected_rows))
-    remaining_rows = _get_remaining_delete_context_rows(client, repo_name, to_delete, components)
-    usage_estimate = _estimate_reclaimable_usage(selected_rows, remaining_rows)
     requested_set = set(requested_tags)
     plan_tags = [
         {
@@ -654,7 +648,6 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
             "manifest_digest": _get_manifest_digest(comp),
             "requested": comp.get("version") in requested_set,
             "same_manifest_alias": comp.get("version") not in requested_set,
-            "size_bytes": selected_row_by_id.get(comp.get("id"), {}).get("size", 0),
         }
         for comp in to_delete
     ]
@@ -667,8 +660,7 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
                 "dry_run": True,
                 "missing_tags": missing_tags,
                 "selected_tags": plan_tags,
-                "usage": usage_estimate,
-                "note": "Estimated reclaimable space excludes blobs still referenced by visible remaining tags/images and requires Nexus cleanup/compaction.",
+                "note": "Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans. Nexus frees disk after its own cleanup/compaction tasks.",
             }
         )
         return
@@ -681,11 +673,8 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
         for comp in to_delete:
             version = comp.get("version", "?")
             alias_note = "" if version in requested_set else "  [same image as requested tag]"
-            click.echo("  -  {0}:{1}  ({2}){3}".format(comp.get("name"), version, _format_bytes(selected_row_by_id.get(comp.get("id"), {}).get("size", 0)), alias_note))
-        click.echo("\nSelected image disk usage: {0}".format(_format_bytes(usage_estimate["selected"])))
-        click.echo("Shared with remaining tags/images: {0}".format(_format_bytes(usage_estimate["shared"])))
-        click.echo("Estimated reclaimable after Nexus cleanup: {0}".format(_format_bytes(usage_estimate["reclaimable"])))
-        click.echo("Note: reclaimable space is an estimate; Nexus frees disk after blob cleanup/compaction tasks.")
+            click.echo("  -  {0}:{1}{2}".format(comp.get("name"), version, alias_note))
+        click.echo("\nNote: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
 
     if dry_run:
         if not json_output:
@@ -699,7 +688,6 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
 
     deleted = []
     errors = []
-    deleted_rows = []
     if not json_output:
         click.echo("")
     for comp in to_delete:
@@ -709,13 +697,11 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
             deleted.append({"id": comp.get("id"), "image": "{0}:{1}".format(image_name, tag), "tag": tag})
             if not json_output:
                 click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(image_name, tag))
-            deleted_rows.append(selected_row_by_id.get(comp.get("id"), {"size": 0, "asset_usage": []}))
         except Nexus3Error as exc:
             errors.append({"id": comp.get("id"), "image": "{0}:{1}".format(image_name, tag), "tag": tag, "error": str(exc)})
             if not json_output:
                 click.echo(click.style("  Failed to delete {0}:{1} — {2}".format(image_name, tag, exc), fg="red"))
 
-    post_delete_estimate = _estimate_reclaimable_usage(deleted_rows, remaining_rows)
     blob_summary = _get_blob_store_summary(client, repo_name)
     if json_output:
         _emit_json(
@@ -727,18 +713,14 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
                 "selected_tags": plan_tags,
                 "deleted": deleted,
                 "errors": errors,
-                "usage": usage_estimate,
-                "successful_delete_reclaimable": post_delete_estimate,
                 "blob_store": blob_summary,
-                "note": "Estimated reclaimable space excludes blobs still referenced by visible remaining tags/images and requires Nexus cleanup/compaction.",
+                "note": "Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans. Nexus frees disk after its own cleanup/compaction tasks.",
             }
         )
         return
 
     click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=len(deleted), err=len(errors)))
-    click.echo("Estimated reclaimable after Nexus cleanup from successful deletes: {0}".format(_format_bytes(post_delete_estimate["reclaimable"])))
-    if post_delete_estimate["shared"]:
-        click.echo("Still shared with remaining tags/images: {0}".format(_format_bytes(post_delete_estimate["shared"])))
+    click.echo("Note: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
     _print_blob_store_summary(blob_summary)
 
 
@@ -846,10 +828,6 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
         filtered_delete.append(comp)
     to_delete = filtered_delete
 
-    selected_rows = _rows_for_components(client, to_delete)
-    remaining_rows = _get_remaining_delete_context_rows(client, repo_name, to_delete, components)
-    usage_estimate = _estimate_reclaimable_usage(selected_rows, remaining_rows)
-
     if json_output and not dry_run and not yes:
         _abort("Refusing JSON prune without --yes or --dry-run.")
 
@@ -862,8 +840,7 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
                 "keep_last": keep_last,
                 "kept_tags": [comp.get("version") for comp in to_keep] + (["latest"] if latest_comp else []),
                 "delete_tags": [comp.get("version") for comp in to_delete],
-                "usage": usage_estimate,
-                "note": "Plan only when dry_run=true; estimated reclaimable space excludes blobs still referenced by visible remaining tags/images and requires Nexus cleanup/compaction.",
+                "note": "Plan only when dry_run=true. Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.",
             }
         )
         if dry_run:
@@ -896,9 +873,7 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
     for comp in to_delete:
         click.echo("  -  {0}:{1}".format(comp.get("name"), comp.get("version")))
 
-    click.echo("\nEstimated selected image disk usage: {0}".format(_format_bytes(usage_estimate["selected"])))
-    click.echo("Estimated shared with remaining tags/images: {0}".format(_format_bytes(usage_estimate["shared"])))
-    click.echo("Estimated reclaimable after Nexus cleanup: {0}".format(_format_bytes(usage_estimate["reclaimable"])))
+    click.echo("\nNote: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
 
     if dry_run:
         click.echo(click.style("\n[dry-run] No changes made.", fg="yellow"))
@@ -932,65 +907,8 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
 
 
 # ---------------------------------------------------------------------------
-# repo-usage / inspect / duplicate helpers
+# inspection / duplicate helpers
 # ---------------------------------------------------------------------------
-
-
-@main.command("repo-usage")
-@click.argument("repo_name")
-@click.option("--image-name", default=None, help="Optional image name or wildcard filter.")
-@click.option("--top", type=int, default=20, show_default=True, help="Number of images to show.")
-@click.option("--sort", "sort_by", type=click.Choice(["size", "tags", "name", "oldest", "newest"]), default="size", show_default=True)
-@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
-def repo_usage(repo_name, image_name, top, sort_by, json_output):
-    """Summarise image usage and tag counts for a Docker repository."""
-    try:
-        client = _get_client()
-        rows = client.list_docker_images(repo_name, name=image_name)
-        blob_summary = _get_blob_store_summary(client, repo_name)
-    except (Nexus3Error, SystemExit) as exc:
-        _abort(str(exc))
-        return
-
-    by_image = {}
-    for row in rows:
-        by_image.setdefault(row["name"], []).append(row)
-    summaries = []
-    for name, image_rows in by_image.items():
-        dates = [r.get("published", datetime.min) for r in image_rows if r.get("published", datetime.min).year != 1]
-        usage = _sum_unique_asset_usage(image_rows)
-        summaries.append(
-            {
-                "name": name,
-                "tags": len(image_rows),
-                "usage_bytes": usage,
-                "usage": _format_bytes(usage),
-                "oldest": min(dates).isoformat() if dates else None,
-                "newest": max(dates).isoformat() if dates else None,
-            }
-        )
-    if sort_by == "tags":
-        summaries.sort(key=lambda s: s["tags"], reverse=True)
-    elif sort_by == "name":
-        summaries.sort(key=lambda s: s["name"])
-    elif sort_by == "oldest":
-        summaries.sort(key=lambda s: s["oldest"] or "")
-    elif sort_by == "newest":
-        summaries.sort(key=lambda s: s["newest"] or "", reverse=True)
-    else:
-        summaries.sort(key=lambda s: s["usage_bytes"], reverse=True)
-    summaries = summaries[:max(top, 0)]
-    total_usage = _sum_unique_asset_usage(rows)
-    if json_output:
-        _emit_json({"repository": repo_name, "images": summaries, "total_usage_bytes": total_usage, "total_usage": _format_bytes(total_usage), "blob_store": blob_summary})
-        return
-    click.echo(click.style("{:<40}  {:>6}  {:>12}  {:<19}  {:<19}".format("IMAGE", "TAGS", "USAGE", "OLDEST", "NEWEST"), bold=True))
-    click.echo("-" * 104)
-    for item in summaries:
-        click.echo("{:<40}  {:>6}  {:>12}  {:<19}  {:<19}".format(item["name"], item["tags"], item["usage"], item["oldest"] or "unknown", item["newest"] or "unknown"))
-    click.echo("\nRepository matched usage: {0}".format(_format_bytes(total_usage)))
-    click.echo("Note: usage is compressed config+layers deduped within the matched result set; reclaimable disk may be lower for shared layers.")
-    _print_blob_store_summary(blob_summary)
 
 
 @main.command("inspect-docker-image")
@@ -1015,25 +933,20 @@ def inspect_docker_image(repo_name, image_name, tag, json_output):
         _abort("Tag not found: {0}:{1}".format(image_name, tag))
     digest = _get_manifest_digest(target)
     aliases = sorted(comp.get("version") for comp in components if comp is not target and _get_manifest_digest(comp) == digest)
-    usage_entries = client.get_component_image_usage(target)
     payload = {
         "repository": repo_name,
         "image_name": image_name,
         "tag": tag,
         "manifest_digest": digest,
         "aliases": aliases,
-        "layer_count": len(usage_entries),
-        "size_bytes": sum(size for _key, size in usage_entries),
-        "size": _format_bytes(sum(size for _key, size in usage_entries)),
-        "entries": [{"digest": key, "size_bytes": size, "size": _format_bytes(size)} for key, size in usage_entries],
+        "note": "Size/layer usage is intentionally not calculated to avoid expensive Nexus manifest/blob API scans.",
     }
     if json_output:
         _emit_json(payload)
         return
     click.echo("Image: {0}/{1}:{2}".format(repo_name, image_name, tag))
     click.echo("Manifest digest: {0}".format(digest or "unknown"))
-    click.echo("Compressed size: {0}".format(payload["size"]))
-    click.echo("Config/layer entries: {0}".format(payload["layer_count"]))
+    click.echo(payload["note"])
     if aliases:
         click.echo("Same-manifest aliases: {0}".format(", ".join(aliases)))
 
@@ -1101,16 +1014,15 @@ def plan_prune(repo_name, image_name, keep_last, exclude_tags, older_than, json_
         if cutoff:
             delete_rows = [r for r in delete_rows if r.get("published", datetime.min) < cutoff]
         if delete_rows:
-            plan.append({"image_name": name, "delete_tags": [r.get("tag") for r in delete_rows], "estimated_selected_usage_bytes": _sum_unique_asset_usage(delete_rows), "estimated_selected_usage": _format_bytes(_sum_unique_asset_usage(delete_rows))})
+            plan.append({"image_name": name, "delete_tags": [r.get("tag") for r in delete_rows]})
     if json_output:
-        _emit_json({"repository": repo_name, "image_name": image_name, "plan": plan, "note": "Plan only; use prune-docker-images/delete-docker-images to execute deletes."})
+        _emit_json({"repository": repo_name, "image_name": image_name, "plan": plan, "note": "Plan only; size/reclaimable estimates are intentionally not calculated. Use prune-docker-images/delete-docker-images to execute deletes."})
         return
     if not plan:
         click.echo("No prune candidates found.")
         return
     for item in plan:
         click.echo("{0}: delete {1}".format(item["image_name"], ", ".join(item["delete_tags"])))
-        click.echo("  selected image usage: {0}".format(item["estimated_selected_usage"]))
 
 
 @main.command("run-cleanup-task")

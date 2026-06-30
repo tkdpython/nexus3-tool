@@ -48,6 +48,13 @@ class FakeClient(object):
             {"name": "team-a/web", "tag": "2", "published": datetime.min, "size": 2048},
         ]
 
+    def iter_docker_images(self, repo_name, name=None, progress_callback=None):
+        rows = self.list_docker_images(repo_name, name=name)
+        for idx, row in enumerate(rows, 1):
+            if progress_callback:
+                progress_callback(idx, {"name": row["name"], "version": row["tag"]})
+            yield row
+
     def get_repository_blob_store_name(self, repo_name):
         return "default"
 
@@ -116,7 +123,7 @@ class DeleteFakeClient(object):
 
 
 class CliTests(unittest.TestCase):
-    def test_list_docker_images_outputs_size_and_blob_store_summary(self):
+    def test_list_docker_images_outputs_tags_and_blob_store_summary(self):
         fake = FakeClient()
         original_get_client = cli._get_client
         cli._get_client = lambda: fake
@@ -128,10 +135,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(fake.repo_name, "docker-hosted")
         self.assertEqual(fake.name, "team-a/*")
-        self.assertIn("SIZE", result.output)
+        self.assertNotIn("SIZE", result.output)
         self.assertIn("team-a/api:1", result.output)
         self.assertIn("Matched tags: 2", result.output)
-        self.assertIn("Matched image disk usage: 3.00 KiB", result.output)
+        self.assertIn("usage is intentionally not calculated", result.output)
         self.assertIn("Nexus blob store: default", result.output)
         self.assertIn("Blob store used: 4.00 KiB", result.output)
         self.assertIn("Blob store available: 8.00 KiB", result.output)
@@ -155,9 +162,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("myapp:alias", result.output)
         self.assertIn("[same image as requested tag]", result.output)
         self.assertIn("myapp:old", result.output)
-        self.assertIn("Selected image disk usage: 300 B", result.output)
-        self.assertIn("Estimated reclaimable after Nexus cleanup: 300 B", result.output)
-        self.assertIn("Estimated reclaimable after Nexus cleanup from successful deletes: 300 B", result.output)
+        self.assertIn("size/reclaimable estimates are intentionally not calculated", result.output)
         self.assertIn("Blob store available: 8.00 KiB", result.output)
 
     def test_delete_docker_images_prompts_by_default(self):
@@ -198,26 +203,19 @@ class CliTests(unittest.TestCase):
         original_get_client = cli._get_client
         cli._get_client = lambda: fake
         try:
-            result = CliRunner().invoke(cli.main, ["list-docker-images", "docker-hosted", "--json", "--sort", "size", "--reverse", "--limit", "1"])
+            result = CliRunner().invoke(cli.main, ["list-docker-images", "docker-hosted", "--json", "--sort", "published", "--reverse", "--limit", "1"])
         finally:
             cli._get_client = original_get_client
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn('"matched_tags": 1', result.output)
-        self.assertIn('"image": "team-a/web:2"', result.output)
+        self.assertIn('"image": "team-a/api:1"', result.output)
 
-    def test_repo_usage_outputs_image_summary(self):
-        fake = FakeClient()
-        original_get_client = cli._get_client
-        cli._get_client = lambda: fake
-        try:
-            result = CliRunner().invoke(cli.main, ["repo-usage", "docker-hosted", "--top", "1"])
-        finally:
-            cli._get_client = original_get_client
+    def test_repo_usage_command_is_removed(self):
+        result = CliRunner().invoke(cli.main, ["repo-usage", "docker-hosted"])
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("IMAGE", result.output)
-        self.assertIn("Repository matched usage", result.output)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No such command", result.output)
 
     def test_inspect_docker_image_reports_aliases(self):
         fake = DeleteFakeClient()
@@ -230,7 +228,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("Same-manifest aliases: alias", result.output)
-        self.assertIn("Compressed size", result.output)
+        self.assertIn("Size/layer usage is intentionally not calculated", result.output)
 
     def test_find_duplicate_tags_reports_same_manifest_tags(self):
         fake = DeleteFakeClient()

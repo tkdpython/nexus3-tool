@@ -365,6 +365,62 @@ class Nexus3Client:
         """Return all Docker components in REPOSITORY."""
         return list(self._iter_pages("/service/rest/v1/components", {"repository": repository}))
 
+    def _component_to_image_row(self, comp):
+        # type: (Dict[str, Any]) -> Dict[str, Any]
+        """Convert a raw Nexus Docker component to a CLI image row."""
+        asset_usage = _get_asset_usage_entries(comp)
+        return {
+            "name": comp.get("name", ""),
+            "tag": comp.get("version", "?"),
+            "published": _get_last_modified(comp),
+            "metadata_size": sum(size for _key, size in asset_usage),
+            "asset_usage": asset_usage,
+        }
+
+    def iter_docker_images(self, repository, name=None, progress_callback=None):
+        # type: (str, Optional[str], Any) -> Iterator[Dict]
+        """Yield Docker image rows incrementally.
+
+        This intentionally does not download Docker manifests or blob layers.
+        It only uses Nexus component metadata so listing remains fast and safe
+        on large production repositories.
+        """
+        wildcard_name = _has_wildcards(name)
+        name_pattern = name or ""
+        if name and not wildcard_name:
+            endpoint = "/service/rest/v1/search"
+            params = {"repository": repository, "name": name, "format": "docker"}
+        else:
+            endpoint = "/service/rest/v1/components"
+            params = {"repository": repository}
+
+        count = 0
+        seen_keys = set()
+        for comp in self._iter_pages(endpoint, params):
+            comp_key = comp.get("id") or (comp.get("name"), comp.get("version"))
+            seen_keys.add(comp_key)
+            comp_name = comp.get("name", "")
+            if wildcard_name and not fnmatchcase(comp_name, name_pattern):
+                continue
+            if name and not wildcard_name and comp_name != name:
+                continue
+            count += 1
+            if progress_callback:
+                progress_callback(count, comp)
+            yield self._component_to_image_row(comp)
+
+        if name and not wildcard_name:
+            # Nexus search indexing can lag or return a partial result just
+            # after a push. Merge with /components, which is authoritative.
+            for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
+                comp_key = comp.get("id") or (comp.get("name"), comp.get("version"))
+                if comp.get("name") == name and comp_key not in seen_keys:
+                    seen_keys.add(comp_key)
+                    count += 1
+                    if progress_callback:
+                        progress_callback(count, comp)
+                    yield self._component_to_image_row(comp)
+
     def list_docker_images(self, repository, name=None):
         # type: (str, Optional[str]) -> List[Dict]
         """Return a list of components with name, tag, date and size.
@@ -373,43 +429,7 @@ class Nexus3Client:
         supports server-side name filtering. Shell-style wildcards (* and ?) are
         matched client-side against component image names.
         """
-        wildcard_name = _has_wildcards(name)
-        name_pattern = name or ""
-        if name and not wildcard_name:
-            # /search supports name filtering reliably
-            endpoint = "/service/rest/v1/search"
-            params = {"repository": repository, "name": name, "format": "docker"}
-        else:
-            endpoint = "/service/rest/v1/components"
-            params = {"repository": repository}
-
-        rows = []
-        components = list(self._iter_pages(endpoint, params))
-        if name and not wildcard_name:
-            # Nexus search indexing can lag or return a partial result just
-            # after a push. Merge with /components, which is authoritative.
-            seen_ids = set(comp.get("id") for comp in components)
-            for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
-                if comp.get("name") == name and comp.get("id") not in seen_ids:
-                    components.append(comp)
-                    seen_ids.add(comp.get("id"))
-        for comp in components:
-            comp_name = comp.get("name", "")
-            if wildcard_name and not fnmatchcase(comp_name, name_pattern):
-                continue
-            if name and not wildcard_name and comp_name != name:
-                continue
-            asset_usage = self.get_component_image_usage(comp)
-            rows.append(
-                {
-                    "name": comp_name,
-                    "tag": comp.get("version", "?"),
-                    "published": _get_last_modified(comp),
-                    "size": sum(size for _key, size in asset_usage),
-                    "asset_usage": asset_usage,
-                }
-            )
-        return rows
+        return list(self.iter_docker_images(repository, name=name))
 
     def get_image_components(self, repository, image_name):
         # type: (str, str) -> List[Dict]

@@ -30,9 +30,8 @@ Options:
 Commands:
   login                 Authenticate with a Nexus3 instance.
   list-docker-repos     List all Docker repositories.
-  list-docker-images    List images and tags in a Docker repository, including size usage.
-  repo-usage            Summarise top images by usage/tag count.
-  inspect-docker-image  Inspect one tag's digest, aliases and layer usage.
+  list-docker-images    List images and tags in a Docker repository.
+  inspect-docker-image  Inspect one tag's digest and aliases.
   find-duplicate-tags   Find tags pointing at the same manifest digest.
   plan-prune            Plan a repository-wide prune without deleting.
   run-cleanup-task      Run a Nexus cleanup/compaction task.
@@ -81,7 +80,7 @@ nexus3-tool list-docker-repos
 
 ### list-docker-images
 
-List images and tags in a repository, with their publish date and compressed Docker image size. The command downloads each tag's Docker/OCI manifest and sums its config and layer descriptor sizes; this avoids reporting only the tiny Nexus manifest asset size. It also prints a summary of the total disk space used by all matched tags, deduplicating shared layer blobs where matching digests are present, and when Nexus exposes the information to your user, the available space on the backing blob store.
+List images and tags in a repository with their publish date. The command intentionally does **not** calculate per-image or repository usage; on large Nexus repositories those manifest/blob API scans can be very expensive. When Nexus exposes the information to your user, the command still prints available space on the backing blob store.
 
 ```bash
 # List all images in a repo
@@ -96,11 +95,11 @@ nexus3-tool list-docker-images development --image-name 'service-?'
 
 # Platform/CI filters
 nexus3-tool list-docker-images development --image-name 'team-a/*' --older-than 30d --exclude-tags latest,main,prod
-nexus3-tool list-docker-images development --sort size --reverse --limit 20
+nexus3-tool list-docker-images development --sort published --reverse --limit 20
 nexus3-tool list-docker-images development --json
 ```
 
-> **Note:** available space is reported for the Nexus blob store that backs the repository, not for an individual Docker repository. Some Nexus users may not have permission to read blob store quota details; in that case the command still shows matched image usage and reports available space as `unknown`.
+> **Note:** available space is reported for the Nexus blob store that backs the repository, not for an individual Docker repository. Some Nexus users may not have permission to read blob store quota details; in that case the command reports available space as `unknown` and continues listing tags.
 
 ---
 
@@ -122,9 +121,9 @@ nexus3-tool delete-docker-images development --image-name myapp --tags old,dev-1
 nexus3-tool delete-docker-images development --image-name myapp --tags old --dry-run --json
 ```
 
-After successful deletes, the command reports the selected image size and a best-effort estimate of reclaimable space after Nexus cleanup. The reclaimable estimate excludes blobs that are still referenced by remaining tags/images visible to the current Nexus user, so shared `FROM` base layers are not counted when they are still in use elsewhere.
+After successful deletes, the command reports whether the backing blob-store total/available space can be read by the current Nexus user. It intentionally does not calculate per-image or reclaimable usage.
 
-> **Note:** The reclaimable number is still an estimate. Nexus only physically frees disk after an administrator runs the *"Delete unused manifest and unreferenced blobs"* and *"Compact blob store"* tasks, and the estimate can only account for manifests the current user can read.
+> **Note:** Deleting tags removes the component from Nexus, but physical disk space is only reclaimed when a Nexus admin runs the *"Delete unused manifest and unreferenced blobs"* and *"Compact blob store"* tasks.
 
 ---
 
@@ -155,21 +154,9 @@ Tags are sorted by last-modified date. If `latest` is an alias for a versioned t
 
 ---
 
-### repo-usage
-
-Show the biggest images, noisy tag families, and repo-level usage summary.
-
-```bash
-nexus3-tool repo-usage development --top 20
-nexus3-tool repo-usage development --sort tags
-nexus3-tool repo-usage development --image-name 'team-a/*' --json
-```
-
----
-
 ### inspect-docker-image
 
-Inspect one tag's manifest digest, compressed config/layer size, and same-manifest aliases such as `latest`, date tags, and commit-SHA tags.
+Inspect one tag's manifest digest and same-manifest aliases such as `latest`, date tags, and commit-SHA tags. This command does not calculate image size/layer usage.
 
 ```bash
 nexus3-tool inspect-docker-image development --image-name myapp --tag latest

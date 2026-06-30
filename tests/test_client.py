@@ -54,11 +54,11 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(client.calls[0][0], "/service/rest/v1/search")
         self.assertEqual(client.calls[1][0], "/service/rest/v1/components")
         self.assertEqual(client.calls[0][1]["name"], "service-api")
-        self.assertEqual(rows[0]["size"], 1024)
+        self.assertEqual(rows[0]["metadata_size"], 1024)
         self.assertEqual(rows[0]["asset_usage"], [(None, 1024)])
         self.assertEqual(rows[0]["published"], datetime(2026, 6, 30, 10, 0, 0))
 
-    def test_list_docker_images_uses_manifest_config_and_layer_sizes(self):
+    def test_list_docker_images_does_not_fetch_manifests_for_size(self):
         manifest_url = "https://nexus.example/repository/docker/v2/service-api/manifests/1.0.0"
         client = FakeClient(
             [
@@ -90,12 +90,9 @@ class ClientTests(unittest.TestCase):
 
         rows = client.list_docker_images("docker-hosted", name="service-api")
 
-        self.assertEqual(client.manifest_urls, [manifest_url])
-        self.assertEqual(rows[0]["size"], 30001234)
-        self.assertEqual(
-            rows[0]["asset_usage"],
-            [("sha256:config", 1234), ("sha256:layer1", 10000000), ("sha256:layer2", 20000000)],
-        )
+        self.assertEqual(client.manifest_urls, [])
+        self.assertEqual(rows[0]["metadata_size"], 1800)
+        self.assertEqual(rows[0]["asset_usage"], [("manifest-json", 1800)])
 
     def test_list_docker_images_filters_wildcards_client_side(self):
         client = FakeClient([
@@ -108,7 +105,7 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(client.calls[0][0], "/service/rest/v1/components")
         self.assertEqual([row["name"] for row in rows], ["team-a/api", "team-a/web"])
-        self.assertEqual(sum(row["size"] for row in rows), 300)
+        self.assertEqual(sum(row["metadata_size"] for row in rows), 300)
     def test_list_docker_images_falls_back_to_components_when_search_is_empty(self):
         class FallbackClient(FakeClient):
             def _iter_pages(self, path, params=None):
