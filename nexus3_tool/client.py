@@ -1,6 +1,7 @@
 """Nexus3 REST API client for nexus3-tool."""
 
 from datetime import datetime
+from fnmatch import fnmatchcase
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
@@ -53,6 +54,40 @@ def _get_last_modified(component):
         if ts > best:
             best = ts
     return best
+
+
+def _get_component_size(component):
+    # type: (Dict[str, Any]) -> int
+    """Return the total file size, in bytes, across a component's assets."""
+    return sum(size for _key, size in _get_asset_usage_entries(component))
+
+
+def _get_asset_usage_entries(component):
+    # type: (Dict[str, Any]) -> List
+    """Return stable dedupe keys and sizes for a component's assets."""
+    entries = []
+    for asset in component.get("assets", []):
+        try:
+            size = int(asset.get("fileSize") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        checksum = asset.get("checksum") or {}
+        key = (
+            checksum.get("sha256")
+            or checksum.get("sha1")
+            or checksum.get("md5")
+            or asset.get("id")
+            or asset.get("downloadUrl")
+            or asset.get("path")
+        )
+        entries.append((key, size))
+    return entries
+
+
+def _has_wildcards(value):
+    # type: (Optional[str]) -> bool
+    """Return True if VALUE contains shell-style wildcard characters."""
+    return bool(value and ("*" in value or "?" in value))
 
 
 class Nexus3Client:
@@ -150,6 +185,37 @@ class Nexus3Client:
         """Return all repositories."""
         return self._get("/service/rest/v1/repositories")
 
+    def get_repository(self, repository):
+        # type: (str) -> Optional[Dict]
+        """Return repository metadata for REPOSITORY, or None when not found."""
+        for repo in self.list_repositories():
+            if repo.get("name") == repository:
+                return repo
+        return None
+
+    def get_repository_blob_store_name(self, repository):
+        # type: (str) -> Optional[str]
+        """Return the blob store used by REPOSITORY when Nexus exposes it."""
+        repo = self.get_repository(repository)
+        if not repo:
+            return None
+        attrs = repo.get("attributes") or {}
+        storage = attrs.get("storage") or {}
+        return storage.get("blobStoreName")
+
+    def list_blob_stores(self):
+        # type: () -> List[Dict]
+        """Return blob store quota/usage information when permitted by Nexus."""
+        return self._get("/service/rest/v1/blobstores")
+
+    def get_blob_store(self, name):
+        # type: (str) -> Optional[Dict]
+        """Return blob store information by name, or None when not found."""
+        for store in self.list_blob_stores():
+            if store.get("name") == name:
+                return store
+        return None
+
     def list_docker_repositories(self):
         # type: () -> List[Dict]
         """Return all Docker-format repositories."""
@@ -157,12 +223,15 @@ class Nexus3Client:
 
     def list_docker_images(self, repository, name=None):
         # type: (str, Optional[str]) -> List[Dict]
-        """Return a list of components with name, tag and last-modified date.
+        """Return a list of components with name, tag, date and size.
 
-        When name is provided, uses the /search endpoint which supports server-side
-        name filtering. Without a name filter, /components is used to list everything.
+        When name is provided without wildcards, uses the /search endpoint which
+        supports server-side name filtering. Shell-style wildcards (* and ?) are
+        matched client-side against component image names.
         """
-        if name:
+        wildcard_name = _has_wildcards(name)
+        name_pattern = name or ""
+        if name and not wildcard_name:
             # /search supports name filtering reliably
             endpoint = "/service/rest/v1/search"
             params = {"repository": repository, "name": name, "format": "docker"}
@@ -172,11 +241,17 @@ class Nexus3Client:
 
         rows = []
         for comp in self._iter_pages(endpoint, params):
+            comp_name = comp.get("name", "")
+            if wildcard_name and not fnmatchcase(comp_name, name_pattern):
+                continue
+            asset_usage = _get_asset_usage_entries(comp)
             rows.append(
                 {
-                    "name": comp.get("name", ""),
+                    "name": comp_name,
                     "tag": comp.get("version", "?"),
                     "published": _get_last_modified(comp),
+                    "size": sum(size for _key, size in asset_usage),
+                    "asset_usage": asset_usage,
                 }
             )
         return rows

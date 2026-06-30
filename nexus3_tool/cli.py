@@ -5,6 +5,7 @@ Commands follow a docker-style pattern:
     nexus3-tool login <url>
     nexus3-tool list-docker-repos
     nexus3-tool list-docker-images <repo>
+    nexus3-tool delete-docker-images <repo> --image-name <image> --tags <tag1,tag2>
     nexus3-tool prune-docker-images <repo> --image-name <image> --keep-last <n>
 """
 
@@ -14,7 +15,14 @@ import click
 
 from nexus3_tool import __version__
 from nexus3_tool.auth import load_credentials, save_credentials
-from nexus3_tool.client import Nexus3Client, Nexus3Error, Nexus3SSLError, _get_last_modified, _get_manifest_digest
+from nexus3_tool.client import (
+    Nexus3Client,
+    Nexus3Error,
+    Nexus3SSLError,
+    _get_asset_usage_entries,
+    _get_last_modified,
+    _get_manifest_digest,
+)
 
 
 def _get_client():
@@ -29,6 +37,161 @@ def _abort(message):
     # type: (str) -> None
     click.echo(click.style("Error: ", fg="red", bold=True) + message, err=True)
     sys.exit(1)
+
+
+def _format_bytes(num_bytes):
+    # type: (int) -> str
+    """Format a byte count using binary units."""
+    try:
+        value = float(num_bytes or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return "{0:.0f} {1}".format(value, unit)
+            return "{0:.2f} {1}".format(value, unit)
+        value /= 1024.0
+    return "{0:.2f} PiB".format(value)
+
+
+def _as_int(value):
+    """Return VALUE as int when it looks numeric, otherwise None."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _blob_metric(blob_store, names):
+    # type: (dict, list) -> object
+    """Return the first numeric metric from BLOB_STORE for any key in NAMES."""
+    for name in names:
+        value = _as_int(blob_store.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def _get_blob_store_summary(client, repo_name):
+    # type: (Nexus3Client, str) -> dict
+    """Return best-effort blob store usage/available-space details for a repo."""
+    summary = dict(name=None, total=None, available=None, error=None)
+    try:
+        blob_name = client.get_repository_blob_store_name(repo_name)
+        if blob_name:
+            blob_store = client.get_blob_store(blob_name)
+        else:
+            blob_stores = client.list_blob_stores()
+            if len(blob_stores) == 1:
+                blob_store = blob_stores[0]
+                blob_name = blob_store.get("name")
+            else:
+                blob_store = None
+        if blob_store:
+            summary["name"] = blob_name or blob_store.get("name")
+            summary["total"] = _blob_metric(blob_store, ["totalSize", "totalSizeInBytes", "blobStoreSize"])
+            summary["available"] = _blob_metric(blob_store, ["availableSpace", "availableSpaceInBytes", "freeSpace"])
+    except Nexus3Error as exc:
+        summary["error"] = str(exc)
+    return summary
+
+
+def _sum_unique_asset_usage(rows):
+    # type: (list) -> int
+    """Return total bytes for matched rows, deduping shared blob assets."""
+    total = 0
+    seen = set()
+    fallback = 0
+    for row in rows:
+        asset_usage = row.get("asset_usage") or []
+        if not asset_usage:
+            fallback += int(row.get("size", 0) or 0)
+            continue
+        for key, size in asset_usage:
+            if key is None:
+                fallback += int(size or 0)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            total += int(size or 0)
+    return total + fallback
+
+
+def _component_asset_usage(component):
+    # type: (dict) -> list
+    """Return dedupe-ready asset usage entries for a Nexus component."""
+    return _get_asset_usage_entries(component)
+
+
+def _component_size(component):
+    # type: (dict) -> int
+    """Return a Nexus component's total asset size in bytes."""
+    return sum(size for _key, size in _component_asset_usage(component))
+
+
+def _parse_tag_list(tags):
+    # type: (str) -> list
+    """Parse a comma-separated tag list, preserving order and removing blanks/duplicates."""
+    parsed = []
+    seen = set()
+    for tag in (tags or "").split(","):
+        clean = tag.strip()
+        if clean and clean not in seen:
+            parsed.append(clean)
+            seen.add(clean)
+    return parsed
+
+
+def _find_delete_components(components, requested_tags):
+    # type: (list, list) -> list
+    """Find requested tag components plus same-manifest aliases for deletion."""
+    requested = set(requested_tags)
+    selected = []
+    selected_ids = set()
+    digests = set()
+
+    for comp in components:
+        if comp.get("version") in requested:
+            comp_id = comp.get("id")
+            if comp_id not in selected_ids:
+                selected.append(comp)
+                selected_ids.add(comp_id)
+            digest = _get_manifest_digest(comp)
+            if digest:
+                digests.add(digest)
+
+    if digests:
+        for comp in components:
+            if comp.get("version") in requested:
+                continue
+            digest = _get_manifest_digest(comp)
+            comp_id = comp.get("id")
+            if digest in digests and comp_id not in selected_ids:
+                selected.append(comp)
+                selected_ids.add(comp_id)
+
+    selected.sort(key=lambda comp: str(comp.get("version", "")))
+    return selected
+
+
+def _print_blob_store_summary(blob_summary):
+    # type: (dict) -> None
+    """Print a consistent blob-store remaining-space summary."""
+    if blob_summary.get("name"):
+        click.echo("Nexus blob store: {0}".format(blob_summary.get("name")))
+    if blob_summary.get("total") is not None:
+        click.echo("Blob store used: {0}".format(_format_bytes(blob_summary.get("total") or 0)))
+    if blob_summary.get("available") is not None:
+        click.echo("Blob store available: {0}".format(_format_bytes(blob_summary.get("available") or 0)))
+    elif blob_summary.get("error"):
+        click.echo("Blob store available: unknown ({0})".format(blob_summary.get("error")))
+    else:
+        click.echo("Blob store available: unknown (not exposed by Nexus for this repository/user).")
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +334,14 @@ def list_docker_repos():
 @click.option(
     "--image-name",
     default=None,
-    help="Filter results to a specific image name (server-side, much faster for large repos).",
+    help="Filter results to an image name. Supports shell-style wildcards (* and ?).",
 )
 def list_docker_images(repo_name, image_name):
     """List all Docker images and tags in REPO_NAME."""
     try:
         client = _get_client()
         rows = client.list_docker_images(repo_name, name=image_name)
+        blob_summary = _get_blob_store_summary(client, repo_name)
     except (Nexus3Error, SystemExit) as exc:
         _abort(str(exc))
         return
@@ -194,9 +358,16 @@ def list_docker_images(repo_name, image_name):
 
     col_image = max(len("{0}:{1}".format(r["name"], r["tag"])) for r in rows)
     col_image = max(col_image, 10)  # minimum width
+    col_size = max(len(_format_bytes(r.get("size", 0))) for r in rows)
+    col_size = max(col_size, len("SIZE"))
 
-    click.echo(click.style("{:<{w}}  {}".format("IMAGE:TAG", "PUBLISHED", w=col_image), bold=True))
-    click.echo("-" * (col_image + 22))
+    click.echo(
+        click.style(
+            "{:<{w}}  {:<16}  {:>{sw}}".format("IMAGE:TAG", "PUBLISHED", "SIZE", w=col_image, sw=col_size),
+            bold=True,
+        )
+    )
+    click.echo("-" * (col_image + col_size + 22))
     for r in rows:
         image_tag = "{0}:{1}".format(r["name"], r["tag"])
         published = r["published"]
@@ -204,7 +375,147 @@ def list_docker_images(repo_name, image_name):
             date_str = "unknown"
         else:
             date_str = published.strftime("%Y-%m-%d %H:%M")
-        click.echo("{:<{w}}  {}".format(image_tag, date_str, w=col_image))
+        click.echo(
+            "{:<{w}}  {:<16}  {:>{sw}}".format(
+                image_tag,
+                date_str,
+                _format_bytes(r.get("size", 0)),
+                w=col_image,
+                sw=col_size,
+            )
+        )
+
+    total_size = _sum_unique_asset_usage(rows)
+    click.echo("\nMatched tags: {0}".format(len(rows)))
+    click.echo("Matched image disk usage: {0}".format(_format_bytes(total_size)))
+
+    _print_blob_store_summary(blob_summary)
+
+
+# ---------------------------------------------------------------------------
+# delete-docker-images
+# ---------------------------------------------------------------------------
+
+
+@main.command("delete-docker-images")
+@click.argument("repo_name")
+@click.option(
+    "--image-name",
+    required=True,
+    help="Name of the image to delete tags from.",
+)
+@click.option(
+    "--tags",
+    required=True,
+    help="Comma-separated list of tags to delete, e.g. 'old,dev-123'.",
+)
+@click.option(
+    "--quiet",
+    is_flag=True,
+    help="Delete immediately without prompting for confirmation.",
+)
+def delete_docker_images(repo_name, image_name, tags, quiet):
+    """Delete selected tags of an image in REPO_NAME.
+
+    Tags listed with --tags are deleted. If another tag of the same image points
+    at the same manifest digest, it is also selected so the confirmation prompt
+    shows all matching aliases before deletion.
+    """
+    requested_tags = _parse_tag_list(tags)
+    if not requested_tags:
+        _abort("No tags supplied. Use --tags tag1,tag2")
+
+    try:
+        client = _get_client()
+        components = client.get_image_components(repo_name, image_name)
+    except (Nexus3Error, SystemExit) as exc:
+        _abort(str(exc))
+        return
+
+    if not components:
+        click.echo("No tags found for '{0}' in repository '{1}'.".format(image_name, repo_name))
+        return
+
+    to_delete = _find_delete_components(components, requested_tags)
+    found_tags = set(comp.get("version") for comp in components)
+    missing_tags = [tag for tag in requested_tags if tag not in found_tags]
+
+    if missing_tags:
+        click.echo(
+            click.style("Warning: ", fg="yellow")
+            + "tag(s) not found for {0}: {1}".format(image_name, ", ".join(missing_tags))
+        )
+
+    if not to_delete:
+        click.echo("No matching tags to delete for '{0}' in repository '{1}'.".format(image_name, repo_name))
+        return
+
+    click.echo(
+        "\nImage: {repo}/{image}  ({n} matching tag(s) selected)".format(
+            repo=repo_name,
+            image=image_name,
+            n=len(to_delete),
+        )
+    )
+    click.echo(click.style("\nTags to delete ({0}):".format(len(to_delete)), fg="red"))
+    requested_set = set(requested_tags)
+    for comp in to_delete:
+        version = comp.get("version", "?")
+        alias_note = "" if version in requested_set else "  [same image as requested tag]"
+        click.echo(
+            "  -  {0}:{1}  ({2}){3}".format(
+                comp.get("name"),
+                version,
+                _format_bytes(_component_size(comp)),
+                alias_note,
+            )
+        )
+
+    selected_rows = [
+        {
+            "size": _component_size(comp),
+            "asset_usage": _component_asset_usage(comp),
+        }
+        for comp in to_delete
+    ]
+    selected_size = _sum_unique_asset_usage(selected_rows)
+    click.echo("\nSelected image disk usage: {0}".format(_format_bytes(selected_size)))
+
+    if not quiet:
+        click.confirm(
+            "\nDelete {0} tag(s)?".format(len(to_delete)),
+            abort=True,
+        )
+
+    click.echo("")
+    deleted = 0
+    errors = 0
+    deleted_rows = []
+    for comp in to_delete:
+        tag = comp.get("version", "?")
+        try:
+            client.delete_component(comp["id"])
+            click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(image_name, tag))
+            deleted += 1
+            deleted_rows.append(
+                {
+                    "size": _component_size(comp),
+                    "asset_usage": _component_asset_usage(comp),
+                }
+            )
+        except Nexus3Error as exc:
+            click.echo(
+                click.style(
+                    "  Failed to delete {0}:{1} — {2}".format(image_name, tag, exc),
+                    fg="red",
+                )
+            )
+            errors += 1
+
+    freed_size = _sum_unique_asset_usage(deleted_rows)
+    click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=deleted, err=errors))
+    click.echo("Space freed by successful deletes: {0}".format(_format_bytes(freed_size)))
+    _print_blob_store_summary(_get_blob_store_summary(client, repo_name))
 
 
 # ---------------------------------------------------------------------------

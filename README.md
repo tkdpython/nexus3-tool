@@ -27,10 +27,11 @@ Options:
   --help     Show this message and exit.
 
 Commands:
-  login                Authenticate with a Nexus3 instance.
-  list-docker-repos    List all Docker repositories.
-  list-docker-images   List images and tags in a Docker repository.
-  prune-docker-images  Prune old tags from a Docker image.
+  login                 Authenticate with a Nexus3 instance.
+  list-docker-repos     List all Docker repositories.
+  list-docker-images    List images and tags in a Docker repository, including size usage.
+  delete-docker-images  Delete selected Docker image tags.
+  prune-docker-images   Prune old tags from a Docker image.
 ```
 
 ---
@@ -68,7 +69,7 @@ nexus3-tool list-docker-repos
 
 ### list-docker-images
 
-List all images and tags in a repository, with their publish date.
+List images and tags in a repository, with their publish date and the disk space used by each tag. The command also prints a summary of the total disk space used by all matched tags, deduplicating shared blob assets where Nexus exposes stable asset identifiers/checksums, and when Nexus exposes the information to your user, the available space on the backing blob store.
 
 ```bash
 # List all images in a repo
@@ -76,7 +77,31 @@ nexus3-tool list-docker-images development
 
 # Filter to a specific image (faster — server-side filtering)
 nexus3-tool list-docker-images development --image-name myapp
+
+# Match image names with shell-style wildcards (* and ?)
+nexus3-tool list-docker-images development --image-name 'team-a/*'
+nexus3-tool list-docker-images development --image-name 'service-?'
 ```
+
+> **Note:** available space is reported for the Nexus blob store that backs the repository, not for an individual Docker repository. Some Nexus users may not have permission to read blob store quota details; in that case the command still shows matched image usage and reports available space as `unknown`.
+
+---
+
+### delete-docker-images
+
+Delete specific tags from a Docker image. `--tags` accepts a comma-separated list. Before deletion, the tool shows every selected tag, including any other tags on the same image that point at the same manifest digest as a requested tag.
+
+```bash
+# Prompt before deleting the requested tag(s) and matching aliases
+nexus3-tool delete-docker-images development --image-name myapp --tags old,dev-123
+
+# Non-interactive delete
+nexus3-tool delete-docker-images development --image-name myapp --tags old,dev-123 --quiet
+```
+
+After successful deletes, the command reports the disk usage represented by the successfully deleted tag components and the remaining blob-store space when Nexus exposes that information to your user.
+
+> **Note:** Nexus may not physically reclaim disk immediately after component deletion. An administrator may still need to run the *"Delete unused manifest and unreferenced blobs"* and *"Compact blob store"* tasks.
 
 ---
 
