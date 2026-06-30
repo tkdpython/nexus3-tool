@@ -28,6 +28,15 @@ class HelperTests(unittest.TestCase):
         selected = cli._find_delete_components(components, ["old"])
 
         self.assertEqual([comp["version"] for comp in selected], ["alias", "old"])
+    def test_estimate_reclaimable_usage_excludes_remaining_shared_layers(self):
+        selected_rows = [{"asset_usage": [("base", 100), ("app", 25)], "size": 125}]
+        remaining_rows = [{"asset_usage": [("base", 100), ("other", 50)], "size": 150}]
+
+        estimate = cli._estimate_reclaimable_usage(selected_rows, remaining_rows)
+
+        self.assertEqual(estimate["selected"], 125)
+        self.assertEqual(estimate["shared"], 100)
+        self.assertEqual(estimate["reclaimable"], 25)
 
 
 class FakeClient(object):
@@ -44,6 +53,12 @@ class FakeClient(object):
 
     def get_blob_store(self, name):
         return {"name": name, "totalSize": 4096, "availableSpace": 8192}
+
+    def list_tasks(self):
+        return [{"id": "cleanup-1", "name": "Cleanup service", "currentState": "WAITING", "lastRunResult": "OK"}]
+
+    def run_task(self, task_id):
+        self.ran_task = task_id
 
 
 class DeleteFakeClient(object):
@@ -80,8 +95,18 @@ class DeleteFakeClient(object):
             },
         ]
 
+    def list_docker_components(self, repo_name):
+        return self.get_image_components(repo_name, "myapp")
+
     def delete_component(self, component_id):
         self.deleted_ids.append(component_id)
+
+    def get_component_image_usage(self, component):
+        entries = []
+        for asset in component.get("assets", []):
+            checksum = asset.get("checksum") or {}
+            entries.append((checksum.get("sha256") or asset.get("path"), int(asset.get("fileSize") or 0)))
+        return entries
 
     def get_repository_blob_store_name(self, repo_name):
         return "default"
@@ -130,7 +155,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("myapp:alias", result.output)
         self.assertIn("[same image as requested tag]", result.output)
         self.assertIn("myapp:old", result.output)
-        self.assertIn("Space freed by successful deletes: 300 B", result.output)
+        self.assertIn("Selected image disk usage: 300 B", result.output)
+        self.assertIn("Estimated reclaimable after Nexus cleanup: 300 B", result.output)
+        self.assertIn("Estimated reclaimable after Nexus cleanup from successful deletes: 300 B", result.output)
         self.assertIn("Blob store available: 8.00 KiB", result.output)
 
     def test_delete_docker_images_prompts_by_default(self):
@@ -149,6 +176,86 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("Delete 2 tag(s)?", result.output)
         self.assertEqual(fake.deleted_ids, [])
+
+    def test_delete_docker_images_dry_run_does_not_delete(self):
+        fake = DeleteFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(
+                cli.main,
+                ["delete-docker-images", "docker-hosted", "--image-name", "myapp", "--tags", "old", "--dry-run"],
+            )
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.deleted_ids, [])
+        self.assertIn("[dry-run] No changes made", result.output)
+
+    def test_list_docker_images_json_output(self):
+        fake = FakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(cli.main, ["list-docker-images", "docker-hosted", "--json", "--sort", "size", "--reverse", "--limit", "1"])
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn('"matched_tags": 1', result.output)
+        self.assertIn('"image": "team-a/web:2"', result.output)
+
+    def test_repo_usage_outputs_image_summary(self):
+        fake = FakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(cli.main, ["repo-usage", "docker-hosted", "--top", "1"])
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("IMAGE", result.output)
+        self.assertIn("Repository matched usage", result.output)
+
+    def test_inspect_docker_image_reports_aliases(self):
+        fake = DeleteFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(cli.main, ["inspect-docker-image", "docker-hosted", "--image-name", "myapp", "--tag", "old"])
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Same-manifest aliases: alias", result.output)
+        self.assertIn("Compressed size", result.output)
+
+    def test_find_duplicate_tags_reports_same_manifest_tags(self):
+        fake = DeleteFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(cli.main, ["find-duplicate-tags", "docker-hosted", "--image-name", "myapp"])
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("myapp: alias, old", result.output)
+
+    def test_run_cleanup_task_starts_and_waits(self):
+        fake = FakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(cli.main, ["run-cleanup-task", "--json"])
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.ran_task, "cleanup-1")
+        self.assertIn('"state": "WAITING"', result.output)
 
 
 if __name__ == "__main__":

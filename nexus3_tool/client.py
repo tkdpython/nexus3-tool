@@ -7,6 +7,17 @@ from typing import Any, Dict, Iterator, List, Optional
 import requests
 from requests.exceptions import ConnectionError, HTTPError, SSLError, Timeout
 
+DOCKER_MANIFEST_ACCEPT = ", ".join(
+    [
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.v1+json",
+        "application/json",
+    ]
+)
+
 
 class Nexus3Error(Exception):
     """Raised for all Nexus3 API errors."""
@@ -64,7 +75,12 @@ def _get_component_size(component):
 
 def _get_asset_usage_entries(component):
     # type: (Dict[str, Any]) -> List
-    """Return stable dedupe keys and sizes for a component's assets."""
+    """Return stable dedupe keys and sizes for a component's REST assets.
+
+    For Docker images this is usually just the manifest asset, which is tiny.
+    Prefer ``Nexus3Client.get_component_image_usage`` when a client is available;
+    it downloads the manifest JSON and sums the config/layer sizes.
+    """
     entries = []
     for asset in component.get("assets", []):
         try:
@@ -82,6 +98,42 @@ def _get_asset_usage_entries(component):
         )
         entries.append((key, size))
     return entries
+
+
+def _get_manifest_asset(component):
+    # type: (Dict[str, Any]) -> Optional[Dict[str, Any]]
+    """Return the Docker manifest asset for a component, if Nexus exposes one."""
+    for asset in component.get("assets", []):
+        path = asset.get("path", "")
+        if "/manifests/" in path:
+            return asset
+    return None
+
+
+def _get_manifest_usage_entries(manifest):
+    # type: (Dict[str, Any]) -> List
+    """Return dedupe keys and compressed sizes from a Docker/OCI manifest JSON."""
+    entries = []
+    config = manifest.get("config") or {}
+    config_digest = config.get("digest")
+    config_size = config.get("size")
+    if config_digest and config_size is not None:
+        entries.append((config_digest, int(config_size or 0)))
+    for layer in manifest.get("layers") or []:
+        digest = layer.get("digest")
+        size = layer.get("size")
+        if digest and size is not None:
+            entries.append((digest, int(size or 0)))
+    return entries
+
+
+def _replace_manifest_reference(download_url, reference):
+    # type: (str, str) -> Optional[str]
+    """Return DOWNLOAD_URL with its /manifests/<ref> suffix replaced."""
+    marker = "/manifests/"
+    if not download_url or marker not in download_url:
+        return None
+    return download_url.rsplit(marker, 1)[0] + marker + reference
 
 
 def _has_wildcards(value):
@@ -121,7 +173,7 @@ class Nexus3Client:
             resp.raise_for_status()
             return resp.json()
         except HTTPError as exc:
-            code = exc.response.status_code
+            code = exc.response.status_code if exc.response is not None else "unknown"
             if code == 401:
                 raise Nexus3Error("Authentication failed. Check your credentials.")
             if code == 403:
@@ -136,6 +188,35 @@ class Nexus3Client:
         except Timeout:
             raise Nexus3Error("Connection timed out.")
 
+    def _get_json_url(self, url, headers=None):
+        # type: (str, Optional[Dict]) -> Any
+        """GET an absolute URL and return its JSON body."""
+        try:
+            resp = self.session.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else "unknown"
+            if code == 401:
+                raise Nexus3Error("Authentication failed. Check your credentials.")
+            if code == 403:
+                raise Nexus3Error("Forbidden — you do not have permission to read the Docker manifest.")
+            if code == 404:
+                raise Nexus3Error("Not found: {0}".format(url))
+            raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
+        except ValueError:
+            raise Nexus3Error("Invalid JSON returned by {0}".format(url))
+        except SSLError as exc:
+            raise Nexus3SSLError("SSL certificate verification failed: {0}".format(exc))
+        except ConnectionError:
+            raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
+        except Timeout:
+            raise Nexus3Error("Connection timed out.")
+
+    def _get_manifest_json(self, url):
+        # type: (str) -> Dict
+        return self._get_json_url(url, headers={"Accept": DOCKER_MANIFEST_ACCEPT})
+
     def _delete(self, path):
         # type: (str) -> None
         try:
@@ -145,11 +226,33 @@ class Nexus3Client:
             )
             resp.raise_for_status()
         except HTTPError as exc:
-            code = exc.response.status_code
+            code = exc.response.status_code if exc.response is not None else "unknown"
             if code == 401:
                 raise Nexus3Error("Authentication failed.")
             if code == 403:
                 raise Nexus3Error("Forbidden — you do not have permission to delete.")
+            raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
+        except SSLError as exc:
+            raise Nexus3SSLError("SSL certificate verification failed: {0}".format(exc))
+        except ConnectionError:
+            raise Nexus3Error("Cannot connect to Nexus at {0}".format(self.base_url))
+        except Timeout:
+            raise Nexus3Error("Connection timed out.")
+
+    def _post(self, path):
+        # type: (str) -> None
+        try:
+            resp = self.session.post(
+                "{0}{1}".format(self.base_url, path),
+                timeout=30,
+            )
+            resp.raise_for_status()
+        except HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else "unknown"
+            if code == 401:
+                raise Nexus3Error("Authentication failed.")
+            if code == 403:
+                raise Nexus3Error("Forbidden — you do not have permission to run that task.")
             raise Nexus3Error("HTTP {0}: {1}".format(code, exc))
         except SSLError as exc:
             raise Nexus3SSLError("SSL certificate verification failed: {0}".format(exc))
@@ -221,6 +324,47 @@ class Nexus3Client:
         """Return all Docker-format repositories."""
         return [r for r in self.list_repositories() if r.get("format") == "docker"]
 
+    def get_component_image_usage(self, component):
+        # type: (Dict[str, Any]) -> List
+        """Return dedupe keys and compressed image sizes for a Docker component.
+
+        Nexus REST component assets for Docker usually represent only the JSON
+        manifest object, so their ``fileSize`` is often just a few KiB. The real
+        compressed image size is recorded inside the Docker/OCI manifest as the
+        config and layer descriptor sizes. This method downloads the manifest
+        from the asset ``downloadUrl`` and returns those descriptor sizes.
+        """
+        manifest_asset = _get_manifest_asset(component)
+        if not manifest_asset:
+            return _get_asset_usage_entries(component)
+        download_url = manifest_asset.get("downloadUrl")
+        if not download_url:
+            return _get_asset_usage_entries(component)
+        try:
+            manifest = self._get_manifest_json(download_url)
+            entries = _get_manifest_usage_entries(manifest)
+
+            # Multi-platform tags return an index/manifest-list. Follow each
+            # child digest and add the usage from every platform manifest.
+            for descriptor in manifest.get("manifests") or []:
+                digest = descriptor.get("digest")
+                child_url = _replace_manifest_reference(download_url, digest)
+                if not child_url:
+                    continue
+                child_manifest = self._get_manifest_json(child_url)
+                entries.extend(_get_manifest_usage_entries(child_manifest))
+
+            if entries:
+                return entries
+        except Nexus3Error:
+            return _get_asset_usage_entries(component)
+        return _get_asset_usage_entries(component)
+
+    def list_docker_components(self, repository):
+        # type: (str) -> List[Dict]
+        """Return all Docker components in REPOSITORY."""
+        return list(self._iter_pages("/service/rest/v1/components", {"repository": repository}))
+
     def list_docker_images(self, repository, name=None):
         # type: (str, Optional[str]) -> List[Dict]
         """Return a list of components with name, tag, date and size.
@@ -240,11 +384,22 @@ class Nexus3Client:
             params = {"repository": repository}
 
         rows = []
-        for comp in self._iter_pages(endpoint, params):
+        components = list(self._iter_pages(endpoint, params))
+        if name and not wildcard_name:
+            # Nexus search indexing can lag or return a partial result just
+            # after a push. Merge with /components, which is authoritative.
+            seen_ids = set(comp.get("id") for comp in components)
+            for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
+                if comp.get("name") == name and comp.get("id") not in seen_ids:
+                    components.append(comp)
+                    seen_ids.add(comp.get("id"))
+        for comp in components:
             comp_name = comp.get("name", "")
             if wildcard_name and not fnmatchcase(comp_name, name_pattern):
                 continue
-            asset_usage = _get_asset_usage_entries(comp)
+            if name and not wildcard_name and comp_name != name:
+                continue
+            asset_usage = self.get_component_image_usage(comp)
             rows.append(
                 {
                     "name": comp_name,
@@ -259,14 +414,33 @@ class Nexus3Client:
     def get_image_components(self, repository, image_name):
         # type: (str, str) -> List[Dict]
         """Return all components (one per tag) for an image in a repository."""
-        return list(
+        items = list(
             self._iter_pages(
                 "/service/rest/v1/search",
                 {"repository": repository, "name": image_name, "format": "docker"},
             )
         )
+        # Search indexing can lag or return partial results just after push;
+        # merge with /components, which is authoritative.
+        seen_ids = set(comp.get("id") for comp in items)
+        for comp in self._iter_pages("/service/rest/v1/components", {"repository": repository}):
+            if comp.get("name") == image_name and comp.get("id") not in seen_ids:
+                items.append(comp)
+                seen_ids.add(comp.get("id"))
+        return items
 
     def delete_component(self, component_id):
         # type: (str) -> None
         """Delete a single component by ID."""
         self._delete("/service/rest/v1/components/{0}".format(component_id))
+
+    def list_tasks(self):
+        # type: () -> List[Dict]
+        """Return Nexus scheduled tasks when permitted."""
+        data = self._get("/service/rest/v1/tasks")
+        return data.get("items", []) if isinstance(data, dict) else data
+
+    def run_task(self, task_id):
+        # type: (str) -> None
+        """Run a Nexus scheduled task by ID."""
+        self._post("/service/rest/v1/tasks/{0}/run".format(task_id))
