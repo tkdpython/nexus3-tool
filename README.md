@@ -129,7 +129,7 @@ After successful deletes, the command reports whether the backing blob-store tot
 
 ### prune-docker-images
 
-Remove old tags from a Docker image, keeping the most recent. The `latest` tag is always preserved and is not counted against `--keep-last`.
+Remove tags from a Docker image by either keeping the most recent tags or deleting tags older than a duration/date. The `latest` tag is always preserved and is not counted against `--keep-last`.
 
 ```bash
 # Preview what would be deleted (no changes made)
@@ -141,6 +141,12 @@ nexus3-tool prune-docker-images production --image-name myapp --keep-last 5
 # Keep the 10 most recent tags, skip confirmation prompt
 nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 --yes
 
+# Delete every tag older than 30 days, without applying a keep-last window
+nexus3-tool prune-docker-images production --image-name myapp --older-than 30d --dry-run
+
+# Protect specific tags even when they match the prune criteria
+nexus3-tool prune-docker-images production --image-name myapp --older-than 1d --protect-tags latest,prod,release-2026-06 --dry-run
+
 # Keep latest/main/prod/stable by default; add age and regex guards for CI-generated tags
 nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 --older-than 30d --include-regex ':[0-9a-f]{8}$' --dry-run
 
@@ -148,7 +154,7 @@ nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 --o
 nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 -y
 ```
 
-Tags are sorted by last-modified date. If `latest` is an alias for a versioned tag, both are annotated in the output so you can see exactly what is being kept.
+Tags are sorted by last-modified date. If `--older-than` is used without `--keep-last`, all non-protected tags older than the cutoff are candidates. Durations support minutes/hours/days/weeks (`30h`, `1d`, `30d`, `2w`) or absolute dates (`YYYY-MM-DD`). If `latest` is an alias for a versioned tag, both are annotated in the output so you can see exactly what is being kept.
 
 > **Note:** Deleting tags removes the component from Nexus, but physical disk space is only reclaimed when a Nexus admin runs the *"Delete unused manifest and unreferenced blobs"* and *"Compact blob store"* tasks.
 
@@ -182,6 +188,7 @@ Produce a repository-wide prune plan without deleting anything.
 
 ```bash
 nexus3-tool plan-prune development --image-name 'team-a/*' --keep-last 10 --older-than 30d
+nexus3-tool plan-prune development --image-name 'team-a/*' --older-than 30d --protect-tags latest,prod
 nexus3-tool plan-prune development --json
 ```
 

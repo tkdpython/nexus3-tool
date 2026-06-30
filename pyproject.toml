@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus3-tool"
-version = "0.6.1"
+version = "0.6.2"
 description = "A CLI tool for managing Sonatype Nexus3 via its REST API"
 readme = "README.md"
 license = { text = "MIT" }

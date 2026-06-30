@@ -122,6 +122,40 @@ class DeleteFakeClient(object):
         return {"name": name, "totalSize": 4096, "availableSpace": 8192}
 
 
+class PruneFakeClient(object):
+    def __init__(self):
+        self.deleted_ids = []
+
+    def get_image_components(self, repo_name, image_name):
+        self.repo_name = repo_name
+        self.image_name = image_name
+        return [
+            self._component("1", image_name, "new", "2026-06-20T00:00:00Z"),
+            self._component("2", image_name, "old", "2026-05-01T00:00:00Z"),
+            self._component("3", image_name, "protected", "2026-04-01T00:00:00Z"),
+            self._component("4", image_name, "very-old", "2026-03-01T00:00:00Z"),
+            self._component("5", image_name, "latest", "2026-06-21T00:00:00Z"),
+        ]
+
+    def _component(self, component_id, name, version, last_modified):
+        return {
+            "id": component_id,
+            "name": name,
+            "version": version,
+            "assets": [
+                {
+                    "path": "v2/{0}/manifests/{1}".format(name, version),
+                    "lastModified": last_modified,
+                    "checksum": {"sha256": "manifest-{0}".format(version)},
+                    "fileSize": 100,
+                }
+            ],
+        }
+
+    def delete_component(self, component_id):
+        self.deleted_ids.append(component_id)
+
+
 class CliTests(unittest.TestCase):
     def test_list_docker_images_outputs_tags_and_blob_store_summary(self):
         fake = FakeClient()
@@ -216,6 +250,65 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("No such command", result.output)
+
+    def test_prune_docker_images_older_than_with_protected_tags(self):
+        fake = PruneFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(
+                cli.main,
+                [
+                    "prune-docker-images",
+                    "docker-hosted",
+                    "--image-name",
+                    "myapp",
+                    "--older-than",
+                    "2026-06-01",
+                    "--protect-tags",
+                    "protected",
+                    "--dry-run",
+                    "--json",
+                ],
+            )
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn('"older_than": "2026-06-01"', result.output)
+        self.assertIn('"protected"', result.output)
+        self.assertIn('"old"', result.output)
+        self.assertIn('"very-old"', result.output)
+        self.assertNotIn('"delete_tags": [\n    "old",\n    "protected"', result.output)
+        self.assertEqual(fake.deleted_ids, [])
+
+    def test_prune_docker_images_keep_last_with_protected_tags_deletes_remaining(self):
+        fake = PruneFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(
+                cli.main,
+                [
+                    "prune-docker-images",
+                    "docker-hosted",
+                    "--image-name",
+                    "myapp",
+                    "--keep-last",
+                    "1",
+                    "--protect-tags",
+                    "protected",
+                    "--yes",
+                ],
+            )
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.deleted_ids, ["2", "4"])
+        self.assertIn("myapp:protected", result.output)
+        self.assertIn("myapp:old", result.output)
+        self.assertIn("myapp:very-old", result.output)
 
     def test_inspect_docker_image_reports_aliases(self):
         fake = DeleteFakeClient()

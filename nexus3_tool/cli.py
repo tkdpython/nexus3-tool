@@ -738,12 +738,13 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
 )
 @click.option(
     "--keep-last",
-    default=5,
-    show_default=True,
-    help="Number of most recent tags to keep.",
+    type=int,
+    default=None,
+    help="Number of most recent tags to keep. Defaults to 5 when --older-than is not used.",
 )
-@click.option("--older-than", default=None, help="Only consider delete candidates older than duration/date, e.g. 30d or 2026-01-31.")
-@click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Comma-separated tags to always keep.")
+@click.option("--older-than", default=None, help="Delete tags older than duration/date, e.g. 30h, 1d, 30d, or 2026-01-31. Can be used instead of --keep-last.")
+@click.option("--protect-tags", default=None, help="Comma-separated tags to always keep, even when selected by --keep-last/--older-than.")
+@click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Deprecated alias for protected tags; comma-separated tags to always keep.")
 @click.option("--include-regex", default=None, help="Only include IMAGE:TAG delete candidates matching this regex.")
 @click.option("--exclude-regex", default=None, help="Exclude IMAGE:TAG delete candidates matching this regex.")
 @click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
@@ -758,16 +759,19 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
     is_flag=True,
     help="Skip the confirmation prompt.",
 )
-def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_tags, include_regex, exclude_regex, json_output, dry_run, yes):
-    """Prune old tags of an image in REPO_NAME.
+def prune_docker_images(repo_name, image_name, keep_last, older_than, protect_tags, exclude_tags, include_regex, exclude_regex, json_output, dry_run, yes):
+    """Prune tags of an image in REPO_NAME.
 
-    Tags are ordered by last-modified date; the most recent --keep-last
-    tags are kept and the rest are deleted.
+    By default, tags are ordered by last-modified date and the most recent 5
+    are kept. Use --keep-last N to choose that count, or use --older-than by
+    itself to delete all tags older than a duration/date. --protect-tags always
+    wins over both selection modes.
 
     Examples:
 
     \b
         nexus3-tool prune-docker-images development --image-name myapp --keep-last 5
+        nexus3-tool prune-docker-images development --image-name myapp --older-than 30d --protect-tags latest,prod
         nexus3-tool prune-docker-images development --image-name myapp --dry-run
     """
     try:
@@ -803,20 +807,42 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
     # Sort versioned tags newest -> oldest
     versioned.sort(key=_get_last_modified, reverse=True)
 
-    to_keep = versioned[:keep_last]
-    to_delete = versioned[keep_last:]
+    if keep_last is None and older_than is None:
+        keep_last = 5
+    if keep_last is not None and keep_last < 0:
+        _abort("--keep-last must be zero or greater")
+    cutoff = _parse_duration(older_than)
 
-    protected_tags = set(_parse_csv(exclude_tags))
+    if keep_last is None:
+        to_keep = []
+        to_delete = []
+        for comp in versioned:
+            if cutoff and _get_last_modified(comp) < cutoff:
+                to_delete.append(comp)
+            else:
+                to_keep.append(comp)
+    else:
+        to_keep = versioned[:keep_last]
+        to_delete = versioned[keep_last:]
+        if cutoff:
+            filtered_by_age = []
+            for comp in to_delete:
+                if _get_last_modified(comp) < cutoff:
+                    filtered_by_age.append(comp)
+                else:
+                    to_keep.append(comp)
+            to_delete = filtered_by_age
+
+    protected_tags = set(_parse_csv(exclude_tags)) | set(_parse_csv(protect_tags))
     include_re = _compile_regex(include_regex, "include regex")
     exclude_re = _compile_regex(exclude_regex, "exclude regex")
-    cutoff = _parse_duration(older_than)
     filtered_delete = []
     for comp in to_delete:
         image_ref = "{0}:{1}".format(comp.get("name", ""), comp.get("version", ""))
         if comp.get("version") in protected_tags:
             to_keep.append(comp)
             continue
-        if cutoff and _get_last_modified(comp) >= cutoff:
+        if cutoff and keep_last is not None and _get_last_modified(comp) >= cutoff:
             to_keep.append(comp)
             continue
         if include_re and not include_re.search(image_ref):
@@ -831,49 +857,56 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
     if json_output and not dry_run and not yes:
         _abort("Refusing JSON prune without --yes or --dry-run.")
 
-    if json_output:
-        _emit_json(
-            {
-                "repository": repo_name,
-                "image_name": image_name,
-                "dry_run": dry_run,
-                "keep_last": keep_last,
-                "kept_tags": [comp.get("version") for comp in to_keep] + (["latest"] if latest_comp else []),
-                "delete_tags": [comp.get("version") for comp in to_delete],
-                "note": "Plan only when dry_run=true. Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.",
-            }
+    plan_payload = {
+        "repository": repo_name,
+        "image_name": image_name,
+        "dry_run": dry_run,
+        "keep_last": keep_last,
+        "older_than": older_than,
+        "protected_tags": sorted(protected_tags),
+        "kept_tags": [comp.get("version") for comp in to_keep] + (["latest"] if latest_comp else []),
+        "delete_tags": [comp.get("version") for comp in to_delete],
+        "note": "Plan only when dry_run=true. Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.",
+    }
+    if json_output and dry_run:
+        _emit_json(plan_payload)
+        return
+    if not json_output:
+        total = len(components)
+        latest_note = " (excludes 'latest' tag which is always kept)" if latest_comp else ""
+        click.echo(
+            "\nImage: {repo}/{image}  ({n} tag(s) found{note})".format(
+                repo=repo_name,
+                image=image_name,
+                n=total,
+                note=latest_note,
+            )
         )
-        if dry_run:
-            return
-    total = len(components)
-    latest_note = " (excludes 'latest' tag which is always kept)" if latest_comp else ""
-    click.echo(
-        "\nImage: {repo}/{image}  ({n} tag(s) found{note})".format(
-            repo=repo_name,
-            image=image_name,
-            n=total,
-            note=latest_note,
-        )
-    )
 
-    click.echo(click.style("\nTags to keep ({0}):".format(len(to_keep) + (1 if latest_comp else 0)), fg="green"))
-    if latest_comp:
-        alias_note = "  [same image as {0}]".format(latest_alias) if latest_alias else ""
-        click.echo("  +  {0}:latest{1}".format(image_name, alias_note))
-    for comp in to_keep:
-        version = comp.get("version")
-        alias_note = "  [latest]".format(version) if version == latest_alias else ""
-        click.echo("  +  {0}:{1}{2}".format(comp.get("name"), version, alias_note))
+        click.echo(click.style("\nTags to keep ({0}):".format(len(to_keep) + (1 if latest_comp else 0)), fg="green"))
+        if latest_comp:
+            alias_note = "  [same image as {0}]".format(latest_alias) if latest_alias else ""
+            click.echo("  +  {0}:latest{1}".format(image_name, alias_note))
+        for comp in to_keep:
+            version = comp.get("version")
+            alias_note = "  [latest]".format(version) if version == latest_alias else ""
+            click.echo("  +  {0}:{1}{2}".format(comp.get("name"), version, alias_note))
 
     if not to_delete:
-        click.echo("\nNothing to delete — all tags are within the keep-last limit.")
+        if json_output:
+            result_payload = dict(plan_payload)
+            result_payload.update({"dry_run": False, "deleted": [], "errors": []})
+            _emit_json(result_payload)
+        else:
+            click.echo("\nNothing to delete — all tags are within the prune criteria.")
         return
 
-    click.echo(click.style("\nTags to delete ({0}):".format(len(to_delete)), fg="red"))
-    for comp in to_delete:
-        click.echo("  -  {0}:{1}".format(comp.get("name"), comp.get("version")))
+    if not json_output:
+        click.echo(click.style("\nTags to delete ({0}):".format(len(to_delete)), fg="red"))
+        for comp in to_delete:
+            click.echo("  -  {0}:{1}".format(comp.get("name"), comp.get("version")))
 
-    click.echo("\nNote: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
+        click.echo("\nNote: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
 
     if dry_run:
         click.echo(click.style("\n[dry-run] No changes made.", fg="yellow"))
@@ -885,25 +918,34 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, exclude_ta
             abort=True,
         )
 
-    click.echo("")
-    deleted = 0
-    errors = 0
+    if not json_output:
+        click.echo("")
+    deleted = []
+    errors = []
     for comp in to_delete:
         tag = comp.get("version", "?")
         try:
             client.delete_component(comp["id"])
-            click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(image_name, tag))
-            deleted += 1
+            deleted.append({"id": comp.get("id"), "image": "{0}:{1}".format(image_name, tag), "tag": tag})
+            if not json_output:
+                click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(image_name, tag))
         except Nexus3Error as exc:
-            click.echo(
-                click.style(
-                    "  Failed to delete {0}:{1} — {2}".format(image_name, tag, exc),
-                    fg="red",
+            errors.append({"id": comp.get("id"), "image": "{0}:{1}".format(image_name, tag), "tag": tag, "error": str(exc)})
+            if not json_output:
+                click.echo(
+                    click.style(
+                        "  Failed to delete {0}:{1} — {2}".format(image_name, tag, exc),
+                        fg="red",
+                    )
                 )
-            )
-            errors += 1
 
-    click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=deleted, err=errors))
+    if json_output:
+        result_payload = dict(plan_payload)
+        result_payload.update({"dry_run": False, "deleted": deleted, "errors": errors})
+        _emit_json(result_payload)
+        return
+
+    click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=len(deleted), err=len(errors)))
 
 
 # ---------------------------------------------------------------------------
@@ -989,11 +1031,12 @@ def find_duplicate_tags(repo_name, image_name, json_output):
 @main.command("plan-prune")
 @click.argument("repo_name")
 @click.option("--image-name", default="*", show_default=True, help="Image name or wildcard to plan.")
-@click.option("--keep-last", default=5, show_default=True, help="Number of most recent non-protected tags to keep per image.")
-@click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Comma-separated tags to always keep.")
-@click.option("--older-than", default=None, help="Only plan candidates older than duration/date.")
+@click.option("--keep-last", type=int, default=None, help="Number of most recent non-protected tags to keep per image. Defaults to 5 when --older-than is not used.")
+@click.option("--protect-tags", default=None, help="Comma-separated tags to always keep, even when selected by --keep-last/--older-than.")
+@click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Deprecated alias for protected tags; comma-separated tags to always keep.")
+@click.option("--older-than", default=None, help="Only plan candidates older than duration/date; can be used instead of --keep-last.")
 @click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
-def plan_prune(repo_name, image_name, keep_last, exclude_tags, older_than, json_output):
+def plan_prune(repo_name, image_name, keep_last, protect_tags, exclude_tags, older_than, json_output):
     """Plan a repository-wide prune without deleting anything."""
     try:
         client = _get_client()
@@ -1004,19 +1047,26 @@ def plan_prune(repo_name, image_name, keep_last, exclude_tags, older_than, json_
     by_image = {}
     for row in rows:
         by_image.setdefault(row["name"], []).append(row)
-    protected = set(_parse_csv(exclude_tags))
+    protected = set(_parse_csv(exclude_tags)) | set(_parse_csv(protect_tags))
+    if keep_last is None and older_than is None:
+        keep_last = 5
+    if keep_last is not None and keep_last < 0:
+        _abort("--keep-last must be zero or greater")
     cutoff = _parse_duration(older_than)
     plan = []
     for name, image_rows in sorted(by_image.items()):
         candidates = [r for r in image_rows if r.get("tag") not in protected]
         candidates.sort(key=lambda r: r.get("published", datetime.min), reverse=True)
-        delete_rows = candidates[keep_last:]
-        if cutoff:
-            delete_rows = [r for r in delete_rows if r.get("published", datetime.min) < cutoff]
+        if keep_last is None:
+            delete_rows = [r for r in candidates if cutoff and r.get("published", datetime.min) < cutoff]
+        else:
+            delete_rows = candidates[keep_last:]
+            if cutoff:
+                delete_rows = [r for r in delete_rows if r.get("published", datetime.min) < cutoff]
         if delete_rows:
             plan.append({"image_name": name, "delete_tags": [r.get("tag") for r in delete_rows]})
     if json_output:
-        _emit_json({"repository": repo_name, "image_name": image_name, "plan": plan, "note": "Plan only; size/reclaimable estimates are intentionally not calculated. Use prune-docker-images/delete-docker-images to execute deletes."})
+        _emit_json({"repository": repo_name, "image_name": image_name, "keep_last": keep_last, "older_than": older_than, "protected_tags": sorted(protected), "plan": plan, "note": "Plan only; size/reclaimable estimates are intentionally not calculated. Use prune-docker-images/delete-docker-images to execute deletes."})
         return
     if not plan:
         click.echo("No prune candidates found.")
