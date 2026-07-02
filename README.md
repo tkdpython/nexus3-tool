@@ -199,6 +199,34 @@ nexus3-tool plan-prune development --json
 
 ---
 
+### prune-docker-repo
+
+Prune many images in a repository using the same retention and protection rules as the planning path. This is useful for scheduled repository maintenance because it avoids putting destructive loops in shell scripts.
+
+```bash
+# Repository-wide dry-run using an active-image whitelist
+nexus3-tool prune-docker-repo development \
+  --image-name '*' \
+  --keep-last 5 \
+  --older-than 30d \
+  --protect-images-file active-images.txt \
+  --dry-run \
+  --json
+
+# Apply the same plan non-interactively after reviewing dry-run output
+nexus3-tool prune-docker-repo development \
+  --image-name '*' \
+  --keep-last 5 \
+  --older-than 30d \
+  --protect-images-file active-images.txt \
+  --yes \
+  --json
+```
+
+Destructive JSON mode requires `--yes`; JSON dry-runs are always allowed.
+
+---
+
 ### run-cleanup-task
 
 Run a Nexus cleanup task and optionally wait for completion. This requires a Nexus user with task-administration permissions.

@@ -162,6 +162,20 @@ class PruneFakeClient(object):
         self.deleted_ids.append(component_id)
 
 
+class RepoPruneFakeClient(PruneFakeClient):
+    def list_docker_components(self, repo_name):
+        self.repo_name = repo_name
+        return [
+            self._component("api-new", "team/api", "new", "2026-06-20T00:00:00Z"),
+            self._component("api-old", "team/api", "old", "2026-05-01T00:00:00Z"),
+            self._component("api-active", "team/api", "active", "2026-04-01T00:00:00Z"),
+            self._component("web-new", "team/web", "new", "2026-06-20T00:00:00Z"),
+            self._component("web-old", "team/web", "old", "2026-05-01T00:00:00Z"),
+            self._component("other-old", "other/job", "old", "2026-05-01T00:00:00Z"),
+            self._component("web-latest", "team/web", "latest", "2026-06-21T00:00:00Z"),
+        ]
+
+
 class CliTests(unittest.TestCase):
     def test_list_docker_images_outputs_tags_and_blob_store_summary(self):
         fake = FakeClient()
@@ -366,6 +380,58 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn('"team-a/web"', result.output)
         self.assertNotIn('"team-a/api"', result.output)
+
+    def test_prune_docker_repo_dry_run_protects_refs_and_deletes_nothing(self):
+        fake = RepoPruneFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with open("active-images.txt", "w") as handle:
+                handle.write("registry.example.com/dev/team/api:active\n")
+            try:
+                result = runner.invoke(
+                    cli.main,
+                    [
+                        "prune-docker-repo",
+                        "docker-hosted",
+                        "--image-name",
+                        "team/*",
+                        "--keep-last",
+                        "1",
+                        "--protect-images-file",
+                        "active-images.txt",
+                        "--dry-run",
+                        "--json",
+                    ],
+                )
+            finally:
+                cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.deleted_ids, [])
+        self.assertIn('"image_name": "team/api"', result.output)
+        self.assertIn('"image_name": "team/web"', result.output)
+        self.assertIn('"old"', result.output)
+        self.assertNotIn('"active"\n        ]', result.output)
+        self.assertNotIn('"other/job"', result.output)
+
+    def test_prune_docker_repo_yes_deletes_selected_components(self):
+        fake = RepoPruneFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        try:
+            result = CliRunner().invoke(
+                cli.main,
+                ["prune-docker-repo", "docker-hosted", "--image-name", "team/*", "--keep-last", "1", "--protect-tags", "active", "--yes", "--json"],
+            )
+        finally:
+            cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.deleted_ids, ["api-old", "web-old"])
+        self.assertIn('"image": "team/api:old"', result.output)
+        self.assertIn('"image": "team/web:old"', result.output)
 
     def test_inspect_docker_image_reports_aliases(self):
         fake = DeleteFakeClient()

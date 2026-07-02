@@ -15,6 +15,7 @@ import re
 import sys
 import time
 from datetime import datetime, timedelta
+from fnmatch import fnmatchcase
 
 import click
 
@@ -394,6 +395,90 @@ def _image_row_matches_any_image_ref(row, image_refs):
         if _image_names_match(ref_name, name) and ref_tag == tag:
             return True
     return False
+
+
+def _image_name_selected(name, pattern):
+    # type: (str, str) -> bool
+    pattern = pattern or "*"
+    if pattern == "*":
+        return True
+    if "*" in pattern or "?" in pattern:
+        return fnmatchcase(name or "", pattern)
+    return name == pattern
+
+
+def _plan_component_prune(components, image_name="*", keep_last=None, older_than=None, protect_tags=None, protect_images_file=None, exclude_tags=None, include_regex=None, exclude_regex=None):
+    """Return a repository prune plan from Nexus component objects."""
+    if keep_last is None and older_than is None:
+        keep_last = 5
+    if keep_last is not None and keep_last < 0:
+        _abort("--keep-last must be zero or greater")
+    cutoff = _parse_duration(older_than)
+    protected_tags = set(_parse_csv(exclude_tags)) | set(_parse_csv(protect_tags))
+    protected_image_refs = _load_image_refs_file(protect_images_file)
+    include_re = _compile_regex(include_regex, "include regex")
+    exclude_re = _compile_regex(exclude_regex, "exclude regex")
+    by_image = {}
+    for comp in components:
+        name = comp.get("name") or ""
+        if _image_name_selected(name, image_name):
+            by_image.setdefault(name, []).append(comp)
+
+    plan = []
+    for name, image_components in sorted(by_image.items()):
+        candidates = []
+        protected = []
+        for comp in image_components:
+            tag = comp.get("version")
+            image_ref = "{0}:{1}".format(name, tag)
+            if tag in protected_tags or _component_matches_any_image_ref(comp, name, protected_image_refs):
+                protected.append(comp)
+                continue
+            if include_re and not include_re.search(image_ref):
+                protected.append(comp)
+                continue
+            if exclude_re and exclude_re.search(image_ref):
+                protected.append(comp)
+                continue
+            candidates.append(comp)
+        candidates.sort(key=_get_last_modified, reverse=True)
+        if keep_last is None:
+            delete_components = [comp for comp in candidates if cutoff and _get_last_modified(comp) < cutoff]
+            keep_components = [comp for comp in candidates if comp not in delete_components]
+        else:
+            keep_components = candidates[:keep_last]
+            delete_components = candidates[keep_last:]
+            if cutoff:
+                age_selected = []
+                for comp in delete_components:
+                    if _get_last_modified(comp) < cutoff:
+                        age_selected.append(comp)
+                    else:
+                        keep_components.append(comp)
+                delete_components = age_selected
+        if delete_components:
+            plan.append(
+                {
+                    "image_name": name,
+                    "kept_tags": [comp.get("version") for comp in keep_components + protected],
+                    "delete_tags": [comp.get("version") for comp in delete_components],
+                    "delete_components": delete_components,
+                }
+            )
+    return {
+        "image_name": image_name,
+        "keep_last": keep_last,
+        "older_than": older_than,
+        "protected_tags": sorted(protected_tags),
+        "protected_images_file": protect_images_file,
+        "protected_image_refs": protected_image_refs,
+        "plan": plan,
+    }
+
+
+def _serialise_repo_prune_plan(plan):
+    # type: (list) -> list
+    return [{"image_name": item["image_name"], "kept_tags": item.get("kept_tags", []), "delete_tags": item.get("delete_tags", [])} for item in plan]
 
 
 def _find_delete_components(components, requested_tags):
@@ -1170,6 +1255,100 @@ def plan_prune(repo_name, image_name, keep_last, protect_tags, protect_images_fi
         return
     for item in plan:
         click.echo("{0}: delete {1}".format(item["image_name"], ", ".join(item["delete_tags"])))
+
+
+@main.command("prune-docker-repo")
+@click.argument("repo_name")
+@click.option("--image-name", default="*", show_default=True, help="Image name or shell-style wildcard to prune.")
+@click.option("--keep-last", type=int, default=None, help="Number of most recent non-protected tags to keep per image. Defaults to 5 when --older-than is not used.")
+@click.option("--older-than", default=None, help="Delete only candidates older than duration/date, e.g. 30d, 12h, 2w, or 2026-01-31.")
+@click.option("--protect-tags", default=None, help="Comma-separated tags to always keep, even when selected by --keep-last/--older-than.")
+@click.option("--protect-images-file", default=None, type=click.Path(exists=True, dir_okay=False), help="File of Docker image references to always keep; one [registry/]image[:tag][@digest] per line.")
+@click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Deprecated alias for protected tags; comma-separated tags to always keep.")
+@click.option("--include-regex", default=None, help="Only include IMAGE:TAG delete candidates matching this regex.")
+@click.option("--exclude-regex", default=None, help="Exclude IMAGE:TAG delete candidates matching this regex.")
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--dry-run", is_flag=True, help="Preview what would be deleted without making any changes.")
+@click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt.")
+def prune_docker_repo(repo_name, image_name, keep_last, older_than, protect_tags, protect_images_file, exclude_tags, include_regex, exclude_regex, json_output, dry_run, yes):
+    """Prune many Docker images in REPO_NAME.
+
+    This is the repository-wide companion to prune-docker-images. It is generic:
+    image selection is controlled by --image-name and safety exclusions by tags,
+    regexes, or a newline-delimited --protect-images-file.
+    """
+    if json_output and not dry_run and not yes:
+        _abort("Refusing JSON repo prune without --yes or --dry-run.")
+    try:
+        client = _get_client()
+        components = client.list_docker_components(repo_name)
+    except (Nexus3Error, SystemExit) as exc:
+        _abort(str(exc))
+        return
+
+    plan_payload = _plan_component_prune(
+        components,
+        image_name=image_name,
+        keep_last=keep_last,
+        older_than=older_than,
+        protect_tags=protect_tags,
+        protect_images_file=protect_images_file,
+        exclude_tags=exclude_tags,
+        include_regex=include_regex,
+        exclude_regex=exclude_regex,
+    )
+    serialised_plan = _serialise_repo_prune_plan(plan_payload["plan"])
+    payload = dict(plan_payload)
+    payload.update({"repository": repo_name, "dry_run": dry_run, "plan": serialised_plan, "note": "Size/reclaimable estimates are intentionally not calculated. Nexus frees disk after cleanup/compaction tasks."})
+
+    if json_output and dry_run:
+        _emit_json(payload)
+        return
+
+    total_tags = sum(len(item["delete_tags"]) for item in serialised_plan)
+    if not serialised_plan:
+        if json_output:
+            payload.update({"deleted": [], "errors": []})
+            _emit_json(payload)
+        else:
+            click.echo("No repo prune candidates found.")
+        return
+
+    if not json_output:
+        click.echo("Repository: {0}".format(repo_name))
+        click.echo("Image selector: {0}".format(image_name))
+        click.echo(click.style("\nTags to delete ({0}):".format(total_tags), fg="red"))
+        for item in serialised_plan:
+            click.echo("  {0}: {1}".format(item["image_name"], ", ".join(item["delete_tags"])))
+        click.echo("\nNote: size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.")
+
+    if dry_run:
+        click.echo(click.style("\n[dry-run] No changes made.", fg="yellow"))
+        return
+
+    if not yes:
+        click.confirm("\nDelete {0} tag(s) across {1} image(s)?".format(total_tags, len(serialised_plan)), abort=True)
+
+    deleted = []
+    errors = []
+    for item in plan_payload["plan"]:
+        for comp in item["delete_components"]:
+            tag = comp.get("version", "?")
+            try:
+                client.delete_component(comp["id"])
+                deleted.append({"id": comp.get("id"), "image_name": item["image_name"], "tag": tag, "image": "{0}:{1}".format(item["image_name"], tag)})
+                if not json_output:
+                    click.echo(click.style("  Deleted ", fg="red") + "{0}:{1}".format(item["image_name"], tag))
+            except Nexus3Error as exc:
+                errors.append({"id": comp.get("id"), "image_name": item["image_name"], "tag": tag, "error": str(exc)})
+                if not json_output:
+                    click.echo(click.style("  Failed to delete {0}:{1} — {2}".format(item["image_name"], tag, exc), fg="red"))
+
+    if json_output:
+        payload.update({"dry_run": False, "deleted": deleted, "errors": errors})
+        _emit_json(payload)
+        return
+    click.echo("\nDone. {ok} deleted, {err} error(s).".format(ok=len(deleted), err=len(errors)))
 
 
 @main.command("run-cleanup-task")
