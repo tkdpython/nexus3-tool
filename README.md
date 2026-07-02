@@ -147,6 +147,9 @@ nexus3-tool prune-docker-images production --image-name myapp --older-than 30d -
 # Protect specific tags even when they match the prune criteria
 nexus3-tool prune-docker-images production --image-name myapp --older-than 1d --protect-tags latest,prod,release-2026-06 --dry-run
 
+# Protect image references from a generic newline-delimited whitelist file
+nexus3-tool prune-docker-images production --image-name team-a/api --older-than 30d --protect-images-file active-images.txt --dry-run
+
 # Keep latest/main/prod/stable by default; add age and regex guards for CI-generated tags
 nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 --older-than 30d --include-regex ':[0-9a-f]{8}$' --dry-run
 
@@ -155,6 +158,8 @@ nexus3-tool prune-docker-images production --image-name myapp --keep-last 10 -y
 ```
 
 Tags are sorted by last-modified date. If `--older-than` is used without `--keep-last`, all non-protected tags older than the cutoff are candidates. Durations support minutes/hours/days/weeks (`30h`, `1d`, `30d`, `2w`) or absolute dates (`YYYY-MM-DD`). If `latest` is an alias for a versioned tag, both are annotated in the output so you can see exactly what is being kept.
+
+`--protect-images-file` accepts a portable whitelist file with one Docker image reference per line. Blank lines and `#` comments are ignored. References may be full registry paths or repository-local image paths, for example `registry.example.com/dev/team-a/api:2026.07.02`, `team-a/api:2026.07.02`, or digest-pinned references such as `team-a/api@sha256:...` when Nexus exposes matching manifest digests.
 
 > **Note:** Deleting tags removes the component from Nexus, but physical disk space is only reclaimed when a Nexus admin runs the *"Delete unused manifest and unreferenced blobs"* and *"Compact blob store"* tasks.
 

@@ -10,6 +10,7 @@ Commands follow a docker-style pattern:
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -306,6 +307,93 @@ def _parse_tag_list(tags):
             parsed.append(clean)
             seen.add(clean)
     return parsed
+
+
+def _load_image_refs_file(path):
+    # type: (str) -> list
+    """Load a newline-delimited Docker image reference file.
+
+    Blank lines and comments are ignored. Inline comments are also ignored so
+    simple operator-maintained files remain readable. The file format is generic:
+    [registry[:port]/]path/name[:tag][@digest], one reference per line.
+    """
+    if not path:
+        return []
+    if not os.path.exists(path):
+        raise click.BadParameter("file not found: {0}".format(path))
+    refs = []
+    seen = set()
+    with open(path, "r") as handle:
+        for line in handle:
+            clean = line.strip()
+            if not clean or clean.startswith("#"):
+                continue
+            if " #" in clean:
+                clean = clean.split(" #", 1)[0].strip()
+            if clean and clean not in seen:
+                refs.append(clean)
+                seen.add(clean)
+    return refs
+
+
+def _split_image_ref(ref):
+    # type: (str) -> tuple
+    """Return (name/path, tag, digest) from a Docker image reference."""
+    ref = (ref or "").strip()
+    digest = None
+    if "@" in ref:
+        ref, digest = ref.split("@", 1)
+    slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    if colon > slash:
+        name = ref[:colon]
+        tag = ref[colon + 1 :]
+    else:
+        name = ref
+        tag = "latest"
+    return name, tag, digest
+
+
+def _image_names_match(ref_name, image_name):
+    # type: (str, str) -> bool
+    """Return True when REF_NAME can refer to Nexus IMAGE_NAME.
+
+    This intentionally allows fully-qualified registry refs, for example
+    registry.example.com/team/app:tag, to protect a Nexus image named team/app.
+    """
+    if not ref_name or not image_name:
+        return False
+    return ref_name == image_name or ref_name.endswith("/" + image_name)
+
+
+def _component_matches_image_ref(component, image_name, image_ref):
+    # type: (dict, str, str) -> bool
+    """Return True if IMAGE_REF protects COMPONENT for IMAGE_NAME."""
+    ref_name, ref_tag, ref_digest = _split_image_ref(image_ref)
+    if not _image_names_match(ref_name, image_name):
+        return False
+    if ref_digest:
+        digest = _get_manifest_digest(component)
+        return bool(digest and digest == ref_digest)
+    return component.get("version") == ref_tag
+
+
+def _component_matches_any_image_ref(component, image_name, image_refs):
+    # type: (dict, str, list) -> bool
+    return any(_component_matches_image_ref(component, image_name, ref) for ref in image_refs)
+
+
+def _image_row_matches_any_image_ref(row, image_refs):
+    # type: (dict, list) -> bool
+    name = row.get("name") or ""
+    tag = row.get("tag") or ""
+    for ref in image_refs:
+        ref_name, ref_tag, ref_digest = _split_image_ref(ref)
+        if ref_digest:
+            continue
+        if _image_names_match(ref_name, name) and ref_tag == tag:
+            return True
+    return False
 
 
 def _find_delete_components(components, requested_tags):
@@ -744,6 +832,7 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
 )
 @click.option("--older-than", default=None, help="Delete tags older than duration/date, e.g. 30h, 1d, 30d, or 2026-01-31. Can be used instead of --keep-last.")
 @click.option("--protect-tags", default=None, help="Comma-separated tags to always keep, even when selected by --keep-last/--older-than.")
+@click.option("--protect-images-file", default=None, type=click.Path(exists=True, dir_okay=False), help="File of Docker image references to always keep; one [registry/]image[:tag][@digest] per line.")
 @click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Deprecated alias for protected tags; comma-separated tags to always keep.")
 @click.option("--include-regex", default=None, help="Only include IMAGE:TAG delete candidates matching this regex.")
 @click.option("--exclude-regex", default=None, help="Exclude IMAGE:TAG delete candidates matching this regex.")
@@ -759,7 +848,7 @@ def delete_docker_images(repo_name, image_name, tags, dry_run, quiet, json_outpu
     is_flag=True,
     help="Skip the confirmation prompt.",
 )
-def prune_docker_images(repo_name, image_name, keep_last, older_than, protect_tags, exclude_tags, include_regex, exclude_regex, json_output, dry_run, yes):
+def prune_docker_images(repo_name, image_name, keep_last, older_than, protect_tags, protect_images_file, exclude_tags, include_regex, exclude_regex, json_output, dry_run, yes):
     """Prune tags of an image in REPO_NAME.
 
     By default, tags are ordered by last-modified date and the most recent 5
@@ -834,12 +923,16 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, protect_ta
             to_delete = filtered_by_age
 
     protected_tags = set(_parse_csv(exclude_tags)) | set(_parse_csv(protect_tags))
+    protected_image_refs = _load_image_refs_file(protect_images_file)
     include_re = _compile_regex(include_regex, "include regex")
     exclude_re = _compile_regex(exclude_regex, "exclude regex")
     filtered_delete = []
     for comp in to_delete:
         image_ref = "{0}:{1}".format(comp.get("name", ""), comp.get("version", ""))
         if comp.get("version") in protected_tags:
+            to_keep.append(comp)
+            continue
+        if _component_matches_any_image_ref(comp, image_name, protected_image_refs):
             to_keep.append(comp)
             continue
         if cutoff and keep_last is not None and _get_last_modified(comp) >= cutoff:
@@ -864,6 +957,8 @@ def prune_docker_images(repo_name, image_name, keep_last, older_than, protect_ta
         "keep_last": keep_last,
         "older_than": older_than,
         "protected_tags": sorted(protected_tags),
+        "protected_images_file": protect_images_file,
+        "protected_image_refs": protected_image_refs,
         "kept_tags": [comp.get("version") for comp in to_keep] + (["latest"] if latest_comp else []),
         "delete_tags": [comp.get("version") for comp in to_delete],
         "note": "Plan only when dry_run=true. Size/reclaimable estimates are intentionally not calculated to avoid expensive Nexus manifest/blob API scans.",
@@ -1033,10 +1128,11 @@ def find_duplicate_tags(repo_name, image_name, json_output):
 @click.option("--image-name", default="*", show_default=True, help="Image name or wildcard to plan.")
 @click.option("--keep-last", type=int, default=None, help="Number of most recent non-protected tags to keep per image. Defaults to 5 when --older-than is not used.")
 @click.option("--protect-tags", default=None, help="Comma-separated tags to always keep, even when selected by --keep-last/--older-than.")
+@click.option("--protect-images-file", default=None, type=click.Path(exists=True, dir_okay=False), help="File of Docker image references to always keep; one [registry/]image[:tag][@digest] per line.")
 @click.option("--exclude-tags", default="latest,main,prod,stable", show_default=True, help="Deprecated alias for protected tags; comma-separated tags to always keep.")
 @click.option("--older-than", default=None, help="Only plan candidates older than duration/date; can be used instead of --keep-last.")
 @click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON.")
-def plan_prune(repo_name, image_name, keep_last, protect_tags, exclude_tags, older_than, json_output):
+def plan_prune(repo_name, image_name, keep_last, protect_tags, protect_images_file, exclude_tags, older_than, json_output):
     """Plan a repository-wide prune without deleting anything."""
     try:
         client = _get_client()
@@ -1048,6 +1144,7 @@ def plan_prune(repo_name, image_name, keep_last, protect_tags, exclude_tags, old
     for row in rows:
         by_image.setdefault(row["name"], []).append(row)
     protected = set(_parse_csv(exclude_tags)) | set(_parse_csv(protect_tags))
+    protected_image_refs = _load_image_refs_file(protect_images_file)
     if keep_last is None and older_than is None:
         keep_last = 5
     if keep_last is not None and keep_last < 0:
@@ -1055,7 +1152,7 @@ def plan_prune(repo_name, image_name, keep_last, protect_tags, exclude_tags, old
     cutoff = _parse_duration(older_than)
     plan = []
     for name, image_rows in sorted(by_image.items()):
-        candidates = [r for r in image_rows if r.get("tag") not in protected]
+        candidates = [r for r in image_rows if r.get("tag") not in protected and not _image_row_matches_any_image_ref(r, protected_image_refs)]
         candidates.sort(key=lambda r: r.get("published", datetime.min), reverse=True)
         if keep_last is None:
             delete_rows = [r for r in candidates if cutoff and r.get("published", datetime.min) < cutoff]
@@ -1066,7 +1163,7 @@ def plan_prune(repo_name, image_name, keep_last, protect_tags, exclude_tags, old
         if delete_rows:
             plan.append({"image_name": name, "delete_tags": [r.get("tag") for r in delete_rows]})
     if json_output:
-        _emit_json({"repository": repo_name, "image_name": image_name, "keep_last": keep_last, "older_than": older_than, "protected_tags": sorted(protected), "plan": plan, "note": "Plan only; size/reclaimable estimates are intentionally not calculated. Use prune-docker-images/delete-docker-images to execute deletes."})
+        _emit_json({"repository": repo_name, "image_name": image_name, "keep_last": keep_last, "older_than": older_than, "protected_tags": sorted(protected), "protected_images_file": protect_images_file, "protected_image_refs": protected_image_refs, "plan": plan, "note": "Plan only; size/reclaimable estimates are intentionally not calculated. Use prune-docker-images/delete-docker-images to execute deletes."})
         return
     if not plan:
         click.echo("No prune candidates found.")

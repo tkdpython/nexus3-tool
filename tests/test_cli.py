@@ -18,6 +18,12 @@ class HelperTests(unittest.TestCase):
     def test_parse_tag_list_removes_blanks_and_duplicates(self):
         self.assertEqual(cli._parse_tag_list("old, dev-1,old,, latest "), ["old", "dev-1", "latest"])
 
+    def test_image_ref_matching_allows_registry_prefix_and_digest(self):
+        component = {"version": "prod", "assets": [{"path": "v2/team/api/manifests/prod", "checksum": {"sha256": "sha256:abc"}}]}
+        self.assertTrue(cli._component_matches_image_ref(component, "team/api", "registry.example.com/dev/team/api:prod"))
+        self.assertTrue(cli._component_matches_image_ref(component, "team/api", "registry.example.com/dev/team/api@sha256:abc"))
+        self.assertFalse(cli._component_matches_image_ref(component, "team/api", "registry.example.com/dev/team/api:old"))
+
     def test_find_delete_components_includes_same_manifest_aliases(self):
         components = [
             {"id": "1", "version": "old", "assets": [{"path": "v2/app/manifests/old", "checksum": {"sha256": "same"}}]},
@@ -309,6 +315,57 @@ class CliTests(unittest.TestCase):
         self.assertIn("myapp:protected", result.output)
         self.assertIn("myapp:old", result.output)
         self.assertIn("myapp:very-old", result.output)
+
+    def test_prune_docker_images_protects_refs_from_file(self):
+        fake = PruneFakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with open("active-images.txt", "w") as handle:
+                handle.write("# active in cluster\nregistry.example.com/dev/myapp:old\n")
+            try:
+                result = runner.invoke(
+                    cli.main,
+                    [
+                        "prune-docker-images",
+                        "docker-hosted",
+                        "--image-name",
+                        "myapp",
+                        "--keep-last",
+                        "1",
+                        "--protect-images-file",
+                        "active-images.txt",
+                        "--yes",
+                    ],
+                )
+            finally:
+                cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.deleted_ids, ["3", "4"])
+        self.assertIn("myapp:old", result.output)
+        self.assertIn("myapp:protected", result.output)
+
+    def test_plan_prune_protects_refs_from_file(self):
+        fake = FakeClient()
+        original_get_client = cli._get_client
+        cli._get_client = lambda: fake
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            with open("active-images.txt", "w") as handle:
+                handle.write("registry.example.com/dev/team-a/api:1\n")
+            try:
+                result = runner.invoke(
+                    cli.main,
+                    ["plan-prune", "docker-hosted", "--image-name", "team-a/*", "--keep-last", "0", "--protect-images-file", "active-images.txt", "--json"],
+                )
+            finally:
+                cli._get_client = original_get_client
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn('"team-a/web"', result.output)
+        self.assertNotIn('"team-a/api"', result.output)
 
     def test_inspect_docker_image_reports_aliases(self):
         fake = DeleteFakeClient()
